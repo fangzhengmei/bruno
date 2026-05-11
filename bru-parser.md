@@ -307,7 +307,11 @@ Bru 纯文本
     ↓
 [数据转换与合并]
     ↓
-最终 JSON 结构
+最终 JSON 结构（@usebruno/lang 输出）
+    ↓
+[Filestore 层归一化]
+    ↓
+可执行请求对象（http-request / graphql-request / grpc-request / ws-request）
 ```
 
 ### 4.4 关键转换函数
@@ -350,7 +354,7 @@ const outdentString = (str, spaces = 2) => {
 
 ## 5. 生成的中间结构（JSON）
 
-### 5.1 HTTP 请求结构
+### 5.1 @usebruno/lang 输出的原始 JSON 结构
 
 ```json
 {
@@ -441,9 +445,368 @@ const outdentString = (str, spaces = 2) => {
 | tests | String | 测试脚本 |
 | docs | String | 文档描述 |
 
-## 6. V1 与 V2 版本对比
+## 6. Filestore 层归一化：从 Bru JSON 到可执行请求对象
 
-### 6.1 主要差异
+### 6.1 类型映射表
+
+| @usebruno/lang meta.type | Filestore 输出 type | Schema 类型 |
+|---------------------------|-----------------------|-------------|
+| http | http-request | HttpRequest |
+| graphql | graphql-request | HttpRequest（复用） |
+| grpc | grpc-request | GrpcRequest |
+| ws | ws-request | WebSocketRequest |
+| 空/其他 | http-request | HttpRequest |
+
+### 6.2 核心转换函数：parseBruRequest
+
+**文件位置**：`packages/bruno-filestore/src/formats/bru/index.ts:12-116`
+
+#### 6.2.1 请求类型分支逻辑
+
+```javascript
+// 第一步：确定请求类型
+let requestType = _.get(json, 'meta.type');
+switch (requestType) {
+  case 'http':
+    requestType = 'http-request';
+    break;
+  case 'graphql':
+    requestType = 'graphql-request';
+    break;
+  case 'grpc':
+    requestType = 'grpc-request';
+    break;
+  case 'ws':
+    requestType = 'ws-request';
+    break;
+  default:
+    requestType = 'http-request';  // 默认回退到 HTTP
+}
+```
+
+#### 6.2.2 URL 路径映射
+
+| 请求类型 | 源字段路径 |
+|----------|-----------|
+| grpc-request | json.grpc.url |
+| ws-request | json.ws.url |
+| http-request | json.http.url |
+| graphql-request | json.http.url |
+| 默认 | json.http.url |
+
+```javascript
+const urlPath: Record<typeof requestType, string> = {
+  'grpc-request': 'grpc.url',
+  'ws-request': 'ws.url',
+  'default': 'http.url'
+};
+```
+
+### 6.3 Method 字段映射
+
+| 请求类型 | 源字段 | 处理逻辑 | 默认值 |
+|----------|--------|----------|--------|
+| http-request | json.http.method | 转大写 | GET |
+| graphql-request | json.http.method | 转大写 | POST |
+| grpc-request | json.grpc.method | 不转大写，保留特殊字符 | 空字符串 |
+| ws-request | 无 | 无 method 字段 | - |
+
+```javascript
+method: requestType === 'grpc-request'
+  ? _.get(json, 'grpc.method', '')
+  : String(_.get(json, 'http.method') ?? '').toUpperCase()
+```
+
+### 6.4 Headers / Metadata 字段映射
+
+| 请求类型 | 源字段 | 目标字段 |
+|----------|--------|----------|
+| grpc-request | json.metadata | request.headers |
+| 其他 | json.headers | request.headers |
+
+```javascript
+headers: requestType === 'grpc-request'
+  ? _.get(json, 'metadata', [])
+  : _.get(json, 'headers', [])
+```
+
+### 6.5 Auth 字段映射
+
+| 请求类型 | auth.mode 源字段 |
+|----------|------------------|
+| grpc-request | json.grpc.auth |
+| ws-request | json.ws.auth |
+| http-request | json.http.auth |
+| graphql-request | json.http.auth |
+| 默认 | 'none' |
+
+Auth 内容始终来自 `json.auth` 对象，包含所有认证方式的配置：
+
+```javascript
+auth: _.get(json, 'auth', {})
+
+// 认证模式单独设置
+if (requestType === 'grpc-request') {
+  transformedJson.request.auth.mode = _.get(json, 'grpc.auth', 'none');
+} else if (requestType === 'ws-request') {
+  transformedJson.request.auth.mode = _.get(json, 'ws.auth', 'none');
+} else {
+  transformedJson.request.auth.mode = _.get(json, 'http.auth', 'none');
+}
+```
+
+### 6.6 Body 字段映射（关键分支）
+
+#### 6.6.1 Body Mode 映射
+
+| 请求类型 | body.mode 源字段 | 默认值 |
+|----------|-----------------|--------|
+| grpc-request | json.grpc.body | 'grpc' |
+| ws-request | json.ws.body | 'ws' |
+| http-request | json.http.body | 'none' |
+| graphql-request | json.http.body | 'none' |
+
+#### 6.6.2 Body 内容分支逻辑
+
+```javascript
+if (requestType === 'grpc-request') {
+  // gRPC 请求体：消息数组格式
+  transformedJson.request.body = _.get(json, 'body', {
+    mode: 'grpc',
+    grpc: _.get(json, 'body.grpc', [
+      { name: 'message 1', content: '{}' }
+    ])
+  });
+} else if (requestType === 'ws-request') {
+  // WebSocket 请求体：消息数组格式
+  transformedJson.request.body = _.get(json, 'body', {
+    mode: 'ws',
+    ws: _.get(json, 'body.ws', [
+      { name: 'message 1', content: '{}' }
+    ])
+  });
+} else {
+  // HTTP / GraphQL：标准 body 对象
+  transformedJson.request.body = _.get(json, 'body', {});
+  transformedJson.request.body.mode = _.get(json, 'http.body', 'none');
+}
+```
+
+#### 6.6.3 Body 类型对照表
+
+| Bru body 块 | 目标 JSON 字段 | 类型 |
+|-------------|---------------|------|
+| body:json | body.json | string |
+| body:text | body.text | string |
+| body:xml | body.xml | string |
+| body:sparql | body.sparql | string |
+| body:graphql | body.graphql.query | string |
+| body:graphql:vars | body.graphql.variables | string |
+| body:form-urlencoded | body.formUrlEncoded | KeyValue[] |
+| body:multipart-form | body.multipartForm | MultipartForm[] |
+| body:file | body.file | FileList |
+| body.grpc | body.grpc | GrpcMessage[] |
+| body.ws | body.ws | WebSocketMessage[] |
+
+### 6.7 Params 字段映射（仅 HTTP/GraphQL）
+
+| 请求类型 | 是否包含 params | 源字段 |
+|----------|----------------|--------|
+| http-request | 是 | json.params |
+| graphql-request | 是 | json.params |
+| grpc-request | 否 | - |
+| ws-request | 否 | - |
+
+```javascript
+if (requestType !== 'grpc-request' && requestType !== 'ws-request') {
+  (transformedJson.request as any).params = _.get(json, 'params', []);
+}
+```
+
+### 6.8 gRPC 特有字段
+
+| 字段 | 源 | 说明 |
+|------|-----|------|
+| methodType | json.grpc.methodType | unary / client-streaming / server-streaming / bidi-streaming |
+| protoPath | json.grpc.protoPath | proto 文件路径 |
+
+```javascript
+if (requestType === 'grpc-request') {
+  const selectedMethodType = _.get(json, 'grpc.methodType');
+  selectedMethodType && ((transformedJson.request as any).methodType = selectedMethodType);
+  const protoPath = _.get(json, 'grpc.protoPath');
+  protoPath && ((transformedJson.request as any).protoPath = protoPath);
+}
+```
+
+### 6.9 OAuth2 额外参数处理
+
+当检测到 OAuth2 认证时，会收集所有额外参数并按类型分组：
+
+```javascript
+const hasOauth2GrantType = json?.auth?.oauth2?.grantType;
+if (hasOauth2GrantType) {
+  const additionalParameters = getOauth2AdditionalParameters(json);
+  const hasAdditionalParameters = Object.keys(additionalParameters || {}).length > 0;
+  if (hasAdditionalParameters) {
+    transformedJson.request.auth.oauth2.additionalParameters = additionalParameters;
+  }
+}
+```
+
+额外参数分类：
+- `authorization`：授权请求参数（仅 authorization_code 和 implicit grant type）
+- `token`：令牌请求参数
+- `refresh`：刷新令牌参数
+
+每个参数包含：name, value, enabled, sendIn(headers/queryparams/body)
+
+### 6.10 完整字段映射表
+
+| Bru 源字段 | 目标请求字段 | 说明 |
+|------------|-------------|------|
+| meta.name | name | 请求名称 |
+| meta.seq | seq | 排序序号，默认 1 |
+| meta.tags | tags | 标签数组 |
+| settings | settings | 请求设置 |
+| http/grpc/ws.method | request.method | 请求方法 |
+| http/grpc/ws.url | request.url | 请求 URL |
+| headers/metadata | request.headers | 请求头/元数据 |
+| auth.* | request.auth.* | 完整认证配置 |
+| http/grpc/ws.auth | request.auth.mode | 当前选中的认证模式 |
+| body.* | request.body.* | 请求体内容 |
+| http/grpc/ws.body | request.body.mode | 当前选中的 body 模式 |
+| params | request.params | 请求参数（仅 HTTP） |
+| script | request.script | 脚本对象 { req, res } |
+| vars | request.vars | 变量对象 { req, res } |
+| assertions | request.assertions | 断言数组 |
+| tests | request.tests | 测试脚本 |
+| docs | request.docs | 文档描述 |
+| examples | examples | 请求示例数组 |
+| grpc.methodType | request.methodType | gRPC 方法类型 |
+| grpc.protoPath | request.protoPath | gRPC proto 文件路径 |
+
+### 6.11 最终输出结构对比
+
+#### 6.11.1 http-request 结构
+
+```typescript
+interface HttpRequest {
+  url: string;
+  method: string;          // 大写，如 "GET", "POST"
+  headers: KeyValue[];
+  params: HttpRequestParam[];  // 包含 type: query | path
+  auth?: Auth | null;
+  body?: HttpRequestBody | null;
+  script?: Script | null;
+  vars?: { req: Variables; res: Variables } | null;
+  assertions?: KeyValue[] | null;
+  tests?: string | null;
+  docs?: string | null;
+}
+
+interface HttpRequestBody {
+  mode: 'none' | 'json' | 'text' | 'xml' | 'formUrlEncoded' | 'multipartForm' | 'graphql' | 'sparql' | 'file';
+  json?: string | null;
+  text?: string | null;
+  xml?: string | null;
+  sparql?: string | null;
+  formUrlEncoded?: KeyValue[] | null;
+  multipartForm?: MultipartForm | null;
+  graphql?: GraphqlBody | null;
+  file?: FileList | null;
+}
+```
+
+#### 6.11.2 grpc-request 结构
+
+```typescript
+interface GrpcRequest {
+  url: string;
+  method?: string | null;        // gRPC 方法名，不转大写
+  methodType?: GrpcMethodType | null;  // unary / streaming
+  protoPath?: string | null;
+  headers: KeyValue[];
+  auth?: Auth | null;
+  body: GrpcRequestBody;
+  script?: Script | null;
+  vars?: { req: Variables; res: Variables } | null;
+  assertions?: KeyValue[] | null;
+  tests?: string | null;
+  docs?: string | null;
+}
+
+interface GrpcRequestBody {
+  mode: 'grpc';
+  grpc?: GrpcMessage[] | null;
+}
+
+interface GrpcMessage {
+  name?: string | null;
+  content?: string | null;
+}
+```
+
+#### 6.11.3 ws-request 结构
+
+```typescript
+interface WebSocketRequest {
+  url: string;
+  headers: KeyValue[];
+  auth?: Auth | null;
+  body: WebSocketRequestBody;
+  script?: Script | null;
+  vars?: { req: Variables; res: Variables } | null;
+  assertions?: KeyValue[] | null;
+  tests?: string | null;
+  docs?: string | null;
+}
+
+interface WebSocketRequestBody {
+  mode: 'ws';
+  ws?: WebSocketMessage[] | null;
+}
+
+interface WebSocketMessage {
+  name?: string | null;
+  type?: string | null;
+  content?: string | null;
+}
+```
+
+## 7. 反向转换：JSON 到 Bru（stringifyBruRequest）
+
+### 7.1 类型反转映射
+
+| Filestore type | Bru meta.type |
+|-----------------|---------------|
+| http-request | http |
+| graphql-request | graphql |
+| grpc-request | grpc |
+| ws-request | ws |
+| 其他 | http |
+
+### 7.2 Method 字段处理
+
+| 请求类型 | 处理逻辑 |
+|----------|----------|
+| grpc-request | 不转小写，保留特殊字符 |
+| http/graphql | 转小写，如 "get", "post" |
+
+### 7.3 Headers / Metadata 反转
+
+| 请求类型 | Bru 目标块 |
+|----------|-----------|
+| grpc-request | metadata { ... } |
+| 其他 | headers { ... } |
+
+### 7.4 Body 反转逻辑
+
+gRPC 和 WebSocket 请求体会被序列化为对应的 grpc/ws 块，而 HTTP 请求体会根据 mode 值序列化为对应的 body:* 块。
+
+## 8. V1 与 V2 版本对比
+
+### 8.1 主要差异
 
 | 特性 | V1 | V2 |
 |------|----|----|
@@ -453,73 +816,100 @@ const outdentString = (str, spaces = 2) => {
 | 支持的块类型 | 较少 | 丰富（支持 gRPC、WebSocket、多种认证） |
 | 扩展性 | 有限 | 良好（可轻松添加新块类型） |
 
-### 6.2 版本迁移
+### 8.2 版本迁移
 
 V2 版本完全向后兼容，推荐使用 V2 格式。
 
-## 7. 关键技术点
+## 9. 关键技术点
 
-### 7.1 Ohm.js 语法解析优势
+### 9.1 Ohm.js 语法解析优势
 
 1. **声明式语法**：使用 PEG 语法定义，可读性高
 2. **分离的语义操作**：语法匹配与语义转换分离
 3. **错误报告**：内置详细的语法错误定位
 4. **可扩展性**：易于扩展新的语法规则
 
-### 7.2 文本块处理策略
+### 9.2 文本块处理策略
 
 1. **缩进处理**：自动处理文本块的缩进
 2. **多行文本**：支持使用 `'''` 包裹的多行文本
 3. **内容类型注解**：支持 `@contentType(...)` 注解
 
-### 7.3 键名处理
+### 9.3 键名处理
 
 1. **特殊字符支持**：键名包含特殊字符时自动加引号
 2. **转义字符**：支持 `\"` 转义引号
 3. **禁用标记**：`~` 前缀标记禁用项
 
-## 8. 使用示例
+### 9.4 请求类型归一化设计
 
-### 8.1 基本用法
+1. **统一输出结构**：所有请求类型共享相同的顶级结构（type, name, seq, settings, tags, request, examples）
+2. **差异化处理**：通过分支逻辑处理不同请求类型的特殊字段
+3. **默认值策略**：为每个请求类型设置合理的默认值，确保即使 Bru 文件不完整也能正常工作
+
+## 10. 使用示例
+
+### 10.1 基本用法
 
 ```javascript
-const { bruToJsonV2, jsonToBruV2 } = require('bruno-lang');
+const { bruToJsonV2, jsonToBruV2 } = require('@usebruno/lang');
+const { parseBruRequest, stringifyBruRequest } = require('@usebruno/filestore/dist/formats/bru');
 
-// Bru 转 JSON
+// 第一步：Bru 纯文本 转 Bru JSON
 const bruContent = fs.readFileSync('request.bru', 'utf8');
-const json = bruToJsonV2(bruContent);
+const bruJson = bruToJsonV2(bruContent);
 
-// JSON 转 Bru
-const bru = jsonToBruV2(json);
+// 第二步：Bru JSON 转 可执行请求对象
+const requestObj = parseBruRequest(bruJson, true);
+console.log(requestObj.type);  // 'http-request', 'grpc-request', 等
+
+// 反向转换
+const bruJsonOut = stringifyBruRequest(requestObj);
+const bruText = jsonToBruV2(bruJsonOut);
 ```
 
-### 8.2 环境文件解析
+### 10.2 环境文件解析
 
 ```javascript
-const { bruToEnvJsonV2 } = require('bruno-lang');
+const { bruToEnvJsonV2 } = require('@usebruno/lang');
 
 const envContent = fs.readFileSync('Local.bru', 'utf8');
 const envJson = bruToEnvJsonV2(envContent);
 ```
 
-## 9. 扩展与维护
+## 11. 扩展与维护
 
-### 9.1 添加新的块类型
+### 11.1 添加新的块类型
 
 1. 在 Ohm grammar 中添加语法规则
 2. 在语义操作中添加转换逻辑
-3. 添加对应的测试用例
+3. 在 filestore 的 parseBruRequest 中添加映射规则
+4. 添加对应的测试用例
 
-### 9.2 常见问题排查
+### 11.2 添加新的请求类型
+
+1. 在 bruToJson.js 中添加新的块解析规则
+2. 在 parseBruRequest 中添加类型分支和字段映射
+3. 更新 Schema 类型定义
+4. 在 stringifyBruRequest 中添加反向转换逻辑
+
+### 11.3 常见问题排查
 
 1. **语法错误**：检查 Ohm grammar 定义是否正确
 2. **转换错误**：检查语义操作中的映射逻辑
 3. **缩进问题**：确认文本块的缩进处理
 4. **特殊字符**：检查键名和值中的特殊字符处理
+5. **类型不匹配**：检查 filestore 层的类型映射是否正确
 
-## 10. 总结
+## 12. 总结
 
 Bru 解析器通过 Ohm.js 提供了强大的语法解析能力，支持丰富的 HTTP 请求定义功能。从 V1 到 V2 的演进中，语法设计更加清晰、扩展性更强，为 Bruno API 客户端提供了坚实的基础。
+
+Filestore 层的归一化处理确保了：
+- 四种请求类型（http-request, graphql-request, grpc-request, ws-request）拥有统一的结构
+- 各类型的特殊字段通过分支逻辑正确映射
+- 合理的默认值策略保证了兼容性和健壮性
+- OAuth2 额外参数的结构化分组便于后续执行层使用
 
 主要特点：
 - 基于 Ohm.js 的 PEG 语法解析
@@ -527,3 +917,4 @@ Bru 解析器通过 Ohm.js 提供了强大的语法解析能力，支持丰富�
 - 灵活的变量和脚本支持
 - 完整的双向转换（Bru ↔ JSON）
 - 良好的扩展性和可维护性
+- 统一的请求对象结构便于执行层处理
