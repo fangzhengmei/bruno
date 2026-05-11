@@ -228,6 +228,128 @@ const context = {
 
 **关键设计结论**：JavaScript 按对象引用传递的特性是变量可见的根本原因。没有任何中间步骤做对象深拷贝，post-response 脚本中对 `runtimeVariables` 的修改是**原地修改**，对后续所有环节（Assertions、Tests）天然可见。
 
+### 修正 5：Assertions 表达式执行边界与副作用风险
+
+**核心机制**：断言表达式不是简单的取值，而是完整的 JS 代码执行
+
+#### LHS 表达式执行原理
+
+**代码实证**（assert-runtime.js:463-465）：
+```javascript
+// 每个断言循环中执行
+const lhs = evaluateJsExpressionBasedOnRuntime(lhsExpr, context, this.runtime);
+const rhs = evaluateRhsOperand(rhsOperand, operator, context, this.runtime);
+```
+
+**关键实现**（assert-runtime.js:342-351）：
+```javascript
+const evaluateJsExpressionBasedOnRuntime = (expr, context, runtime) => {
+  if (runtime === 'quickjs') {
+    return executeQuickJsVm({
+      script: expr,      // ← 直接将 LHS 表达式作为脚本执行
+      context,           // ← 完整上下文：bru, req, res, 所有变量
+      scriptType: 'expression'
+    });
+  }
+  return evaluateJsExpression(expr, context);  // Node VM 模式同样执行完整 JS
+};
+```
+
+**上下文注入完整度**（quickjs/index.js:61-70）：
+```javascript
+const vm = QuickJSModule.newContext();
+const { bru, req, res, ...variables } = externalContext;
+
+bru && addBruShimToContext(vm, bru);      // ← 注入完整 bru 对象
+req && addBrunoRequestShimToContext(vm, req);  // ← 注入完整 req 对象
+res && addBrunoResponseShimToContext(vm, res); // ← 注入完整 res 对象
+
+Object.entries(variables)?.forEach(([key, value]) => {
+  vm.setProp(vm.global, key, marshallToVm(value, vm));
+});
+```
+
+#### 副作用风险说明
+
+**理论可行的风险写法**（实际不建议）：
+```javascript
+// LHS 表达式可以执行任意 JS，包括产生副作用
+bru.setVar('hijacked', 'value')        // ← 设置变量
+bru.setEnvVar('leak', env.password)    // ← 设置环境变量
+req.setHeader('X-Hijack', 'bad')       // ← 修改请求（断言在响应后执行，影响后续）
+res.headers = {}                       // ← 修改响应对象
+JSON.stringify(res)                    // ← 序列化整个响应（性能损耗）
+```
+
+**为什么会生效？**
+1. ✅ `bru` 对象完整注入到表达式执行上下文
+2. ✅ `bru.setVar/setEnvVar` 等方法直接修改原始引用对象
+3. ✅ 没有任何沙箱级别限制表达式的副作用
+4. ✅ 循环中每个断言独立执行，后执行的断言可以看到前一个的副作用
+
+#### 风险影响范围
+
+| 执行环境 | 副作用风险 | 说明 |
+|---------|-----------|------|
+| QuickJS 沙箱 | ✅ 有风险 | 注入了完整的 bru shim，可以调用 setVar 等方法 |
+| Node VM 沙箱 | ✅ 有风险 | 直接注入 bru 对象引用，无限制 |
+
+**影响顺序**：
+```
+断言 1 执行：bru.setVar('a', 1) → 修改 runtimeVariables
+    ↓
+断言 2 执行：可以读取到 a = 1
+    ↓
+Tests 执行：可以读取到 a = 1
+```
+
+#### 建议写法与最佳实践
+
+**✅ 推荐写法（纯表达式，无副作用）**：
+```javascript
+// 简单取值
+res.status
+res('data.items[0].name')
+res.headers['content-type']
+
+// 简单运算
+res('data.items').length > 0
+res.status === 200
+
+// 使用已设置的变量
+res('data.count') === expectedCount
+```
+
+**❌ 不推荐写法（有副作用，难以维护）**：
+```javascript
+// 设置变量 - 应放在 post-response 脚本中
+bru.setVar('count', res('data.items').length)
+
+// 修改环境 - 应放在 post-response 脚本中
+bru.setEnvVar('lastId', res('data.id'))
+
+// 复杂逻辑 - 应放在 Tests 脚本中
+(() => {
+  const items = res('data.items');
+  items.forEach(item => { /* ... */ });
+  return items.length;
+})()
+```
+
+**架构建议**：
+1. **职责分离原则**：
+   - Assertions：仅用于结果验证，编写纯表达式
+   - Post-response 脚本：用于数据提取、变量设置
+   - Tests 脚本：用于复杂断言逻辑、数据处理
+
+2. **可观测性原则**：
+   - 断言失败时应只显示表达式值，不隐藏副作用
+   - 变量设置应显式在脚本中，不隐藏在断言表达式里
+
+3. **性能原则**：
+   - 每个断言独立创建 QuickJS 上下文，复杂表达式有性能开销
+   - 循环 + 复杂表达式会显著增加执行时间
+
 ---
 
 ## 执行链路
@@ -264,6 +386,7 @@ const context = {
    ├─ AssertRuntime.runAssertions()
    ├─ 上下文：Bru + BrunoRequest + createResponseParser() 返回的 res 对象
    ├─ ✅ runtimeVariables 已包含 post-response 中设置的变量
+   ├─ ⚠️ LHS 是完整 JS 表达式执行，可能产生副作用
    ├─ 遍历所有启用的断言
    └─ 收集 pass/fail 结果
     ↓
@@ -350,8 +473,9 @@ runTests() 抛出异常
 ├─ Post-response 中 bru.setVar(key, value) 设置的变量
 │   ├─ ✅ Assertions 可见（对象引用传递，原地修改）
 │   └─ ✅ Tests 可见
-└─ Assertions 中只能使用内置变量，不能设置变量
-    └─ Tests 中设置的变量不会反向影响 Assertions（已执行完）
+└─ Assertions 中通过表达式执行 bru.setVar() 设置的变量
+    ├─ ✅ 后续 Assertions 可见（按断言顺序执行）
+    └─ ✅ Tests 可见（不推荐，应放在 post-response 中）
 ```
 
 **关键澄清**：
@@ -535,7 +659,7 @@ AssertRuntime.runAssertions()
   ├─ createResponseParser() → 解析响应（函数式对象）
   ├─ 构建 context { bru, req, res, 所有层级变量 }
   └─ 遍历断言
-     ├─ evaluateJsExpressionBasedOnRuntime() → LHS 求值
+     ├─ evaluateJsExpressionBasedOnRuntime() → LHS 求值（完整 JS 执行）
      ├─ parseAssertionOperator() → 操作符解析
      ├─ evaluateRhsOperand() → RHS 求值
      ├─ chai 断言执行
