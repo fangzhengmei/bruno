@@ -17,9 +17,9 @@
 
 Bruno 的 Collection Runner 有两套独立实现，共享核心逻辑一致：
 
-| 版本 | 核心执行文件 | 循环起始行号 |
-|-----|-------------|----------|
-| **CLI 版本** | `bruno-cli/src/commands/run.js` | `line 668-753` |
+| 版本 | 核心执行文件 | 循环精确行号范围 |
+|-----|-------------|---------------|
+| **CLI 版本** | `bruno-cli/src/commands/run.js` | `line 680-765` |
 | **桌面端版本** | `bruno-electron/src/ipc/network/index.js` | `line 1368-1893` |
 
 ### 主要组件：
@@ -103,12 +103,12 @@ bruno run folder --bail               # 遇错即停
 
 **CLI 循环实现**:
 ```javascript
-// bruno-cli/src/commands/run.js:668-753
+// bruno-cli/src/commands/run.js:680-765
 let currentRequestIndex = 0;
 let nJumps = 0; // count the number of jumps to avoid infinite loops
 while (currentRequestIndex < requestItems.length) {
   // 仅请求级循环，无外层数据迭代循环
-  // line 734-752: 跳转逻辑
+  // line 746-764: 跳转逻辑
 }
 ```
 
@@ -134,69 +134,96 @@ while (currentRequestIndex < folderRequests.length) {
 
 ## CLI Runner 实现位置
 
-### CLI 核心循环
+### CLI 核心循环（精确行号核对）
 **文件**: `bruno-cli/src/commands/run.js`
-**行号**: `line 668-753`
+**行号**: `line 680-765`
 
 ```javascript
-// line 668-669: 循环初始化
+// line 680-681: 循环初始化
 let currentRequestIndex = 0;
 let nJumps = 0; // count the number of jumps to avoid infinite loops
 
-// line 670: while 循环开始
+// line 682: while 循环开始
 while (currentRequestIndex < requestItems.length) {
 
-  // line 675-687: 执行单个请求
+  // line 687-699: 执行单个请求
   const result = await runSingleRequest(...);
 
-  // line 691-694: 延迟处理
+  // line 701-710: 延迟处理 (isLastRun, isValidDelay)
+  // line 703-706: 实际延迟等待
   if (isValidDelay && !isLastRun) {
     await new Promise((resolve) => setTimeout(resolve, delay));
   }
 
-  // line 715-725: --bail 终止逻辑
-  if (bail) { /* ... */ break; }
+  // line 712-718: 收集执行结果到 results 数组
+  results.push({ ...result, ... });
 
-  // line 728: 获取下一个请求名
+  // line 720-725: 对结果进行 sanitize 处理用于 reporter
+
+  // line 727-737: --bail 终止逻辑（遇错即停）
+  if (bail) {
+    const requestFailure = result?.error && !result?.skipped;
+    const testFailure = result?.testResults?.find((iter) => iter.status === 'fail');
+    const assertionFailure = result?.assertionResults?.find((iter) => iter.status === 'fail');
+    const preRequestTestFailure = result?.preRequestTestResults?.find((iter) => iter.status === 'fail');
+    const postResponseTestFailure = result?.postResponseTestResults?.find((iter) => iter.status === 'fail');
+    if (requestFailure || testFailure || assertionFailure || preRequestTestFailure || postResponseTestFailure) {
+      break; // line 735: 遇错立即终止循环
+    }
+  }
+
+  // line 739-740: 获取下一个请求名
   const nextRequestName = result?.nextRequestName;
 
-  // line 730-732: stopRunner 终止
+  // line 742-744: shouldStopRunnerExecution 终止
   if (result?.shouldStopRunnerExecution) {
     break;
   }
 
-  // line 734-752: 跳转决策
+  // line 746-764: 跳转决策核心逻辑
   if (nextRequestName !== undefined) {
-    nJumps++;
-    if (nJumps > 10000) { /* 无限循环防护 */ }
-    if (nextRequestName === null) { break; }
-    const nextRequestIdx = requestItems.findIndex(...);
+    nJumps++; // line 747
+    // line 748-751: 无限循环防护 (>10000 次)
+    if (nJumps > 10000) {
+      console.error(chalk.red(`Too many jumps, possible infinite loop`));
+      process.exit(constants.EXIT_STATUS.ERROR_INFINITE_LOOP);
+    }
+    // line 752-753: 显式终止（setNextRequest(null)）
+    if (nextRequestName === null) {
+      break;
+    }
+    // line 755: 按请求名查找下一个请求索引
+    const nextRequestIdx = requestItems.findIndex((iter) => iter.name === nextRequestName);
+    // line 756-761: 跳转或顺序执行
     if (nextRequestIdx >= 0) {
       currentRequestIndex = nextRequestIdx; // 跳转到指定请求
     } else {
-      currentRequestIndex++; // 顺序执行
+      console.error('Could not find request with name \'' + nextRequestName + '\'');
+      currentRequestIndex++; // 找不到则顺序执行
     }
   } else {
-    currentRequestIndex++; // 顺序执行
+    currentRequestIndex++; // line 763: 无跳转指令，顺序执行
   }
-}
+} // line 765: while 循环结束
 ```
 
-### CLI 单请求执行
+### CLI 单请求执行（精确行号）
 **文件**: `bruno-cli/src/runner/run-single-request.js`
-**职责**: 执行单个 HTTP 请求，包括脚本执行，变量插值
-**关键行号**:
-- Pre-request 脚本: `line 130-240`
-- Post-response 脚本: `line 720-820`
-- Tests 脚本: `line 830-890`
-- Assertions: `line 821-828`
-- 跳转名称传递: `line 134-135, 232-237, 272, 285-292, 324-325, 726-727, 775-780, 806-811, 853-858, 883-888, 925-926`
+**关键行号核对**:
+- **变量初始化**: `line 134-135` (`nextRequestName`, `shouldStopRunnerExecution`)
+- **Pre-request 脚本**: `line 130-240`
+- **Pre-request 错误捕获**: `line 241-298`
+- **HTTP 请求发送**: `line 500-670`
+- **Post-response 脚本**: `line 720-820`
+- **Assertions 执行**: `line 821-828`
+- **Tests 脚本**: `line 830-890`
+- **nextRequestName 传递点**: `line 134, 232-237, 272, 285-292, 324-325, 726-727, 775-780, 806-811, 853-858, 883-888, 925-926`
 
 ---
 
 ## 桌面 Runner 实现位置
 
-### 桌面端核心循环
+### 桌面端核心循环（精确行号核对）
 **文件**: `bruno-electron/src/ipc/network/index.js`
 **行号**: `line 1368-1893`
 
@@ -208,49 +235,97 @@ let nJumps = 0; // count the number of jumps to avoid infinite loops
 // line 1370: while 循环开始
 while (currentRequestIndex < folderRequests.length) {
 
-  // line 1372-1376: 检查取消信号
-  if (abortController.signal.aborted) { throw error; }
+  // line 1372-1376: 检查取消信号（用户点击 Cancel）
+  if (abortController.signal.aborted) {
+    let error = new Error('Runner execution cancelled');
+    error.isCancel = true;
+    throw error; // 终止整个 Runner
+  }
 
-  // line 1398-1413: 跳过 gRPC 请求
-  if (item.type === 'grpc-request') { /* ... */ continue; }
+  // line 1378: 重置停止标志
+  stopRunnerExecution = false;
 
-  // line 1420-1439: 跳过含 Prompt 变量的请求
-  if (promptVars.length > 0) { /* ... */ continue; }
+  // line 1398-1413: 跳过 gRPC 请求（Collection Runner 不支持）
+  if (item.type === 'grpc-request') {
+    // 发送 runner-request-skipped 事件
+    continue;
+  }
+
+  // line 1415: prepareRequest() 合并变量（Collection -> Folder -> Request）
+
+  // line 1420-1439: 跳过含 Prompt 变量的请求（需要用户交互）
+  if (promptVars.length > 0) {
+    // 发送 runner-request-skipped 事件
+    continue;
+  }
 
   // line 1456-1505: Pre-request 脚本执行
+  // line 1507-1509: 提取 Pre-request 的 nextRequestName
+  // line 1511-1513: 提取 Pre-request 的 stopRunnerExecution
   // line 1515-1530: skipRequest 跳过当前请求
 
   // line 1532-1694: 发送 HTTP 请求
+  // line 1652-1654: 用户取消请求（axios.isCancel）
+  // line 1656-1689: 4XX/5XX 响应处理（有响应体，继续执行）
+  // line 1690-1693: 网络错误/DNS 错误（无响应体，终止请求）
 
   // line 1697-1754: Post-response 脚本执行
+  // line 1739-1741: 提取 Post-response 的 nextRequestName（覆盖前面的值）
+  // line 1743-1745: 提取 Post-response 的 stopRunnerExecution（覆盖前面的值）
 
   // line 1756-1775: 执行 Assertions
 
   // line 1777-1853: 执行 Tests 脚本
+  // line 1785: testRuntime.runTests() 执行测试脚本
+  // line 1815: appendScriptErrorResult() 追加错误结果
+  // line 1817-1819: 提取 Tests 的 nextRequestName（最终生效）
 
-  // line 1863-1873: stopRunnerExecution 终止
-  if (stopRunnerExecution) { /* ... */ break; }
+  // line 1863-1873: stopRunnerExecution 终止分支
+  if (stopRunnerExecution) {
+    deleteCancelToken(cancelTokenUid);
+    mainWindow.webContents.send('main:run-folder-event', {
+      type: 'testrun-ended',
+      collectionUid,
+      folderUid,
+      statusText: 'collection run was terminated!',
+      runCompletionTime: new Date().toISOString()
+    });
+    break; // line 1872: 终止循环
+  }
 
-  // line 1875-1892: 跳转决策
+  // line 1875-1892: 跳转决策核心逻辑
   if (nextRequestName !== undefined) {
-    nJumps++;
-    if (nJumps > 10000) { throw error; }
-    if (nextRequestName === null) { break; }
-    const nextRequestIdx = folderRequests.findIndex(...);
+    nJumps++; // line 1876
+    // line 1877-1879: 无限循环防护 (>10000 次)
+    if (nJumps > 10000) {
+      throw new Error('Too many jumps, possible infinite loop');
+    }
+    // line 1880-1882: 显式终止（setNextRequest(null)）
+    if (nextRequestName === null) {
+      break;
+    }
+    // line 1883: 按请求名查找下一个请求索引
+    const nextRequestIdx = folderRequests.findIndex((request) => request.name === nextRequestName);
+    // line 1884-1889: 跳转或顺序执行
     if (nextRequestIdx >= 0) {
       currentRequestIndex = nextRequestIdx; // 跳转到指定请求
     } else {
-      currentRequestIndex++; // 顺序执行
+      console.error('Could not find request with name \'' + nextRequestName + '\'');
+      currentRequestIndex++; // 找不到则顺序执行
     }
   } else {
-    currentRequestIndex++; // 顺序执行
+    currentRequestIndex++; // line 1891: 无跳转指令，顺序执行
   }
-}
+} // line 1893: while 循环结束
 ```
 
 ### 桌面端 IPC 通信层
 **文件**: `bruno-electron/src/ipc/network/index.js`
-**行号**: `line 1273-1914` (renderer:run-collection-folder handler)
+**关键位置**:
+- **IPC Handler 开始**: `line 1273` (`renderer:run-collection-folder`)
+- **标签过滤**: `line 1343-1350`
+- **选中请求过滤**: `line 1352-1366`
+- **循环结束清理**: `line 1895-1901`
 
 ### 桌面端 UI 触发层
 **文件**: `bruno-app/src/components/RunnerResults/RunConfigurationPanel/index.jsx`
@@ -297,20 +372,22 @@ RunConfigurationPanel 加载请求列表
     ↓
 应用标签过滤 (line 637-639)
     ↓
-开始执行请求循环 (line 668)
+开始执行请求循环 (line 680)
 ```
 
 ### 2. 请求收集与排序
 
 **排序优先级**（从高到低）：
-1. **用户自定义排序**: `selectedRequestUids` 指定的顺序
+1. **用户自定义排序**: `selectedRequestUids` 指定的顺序（桌面端独有）
 2. **保存的配置排序**: `runnerConfiguration.requestItemsOrder`
 3. **文件夹 seq 属性排序**: `sortByNameThenSequence()`
 4. **递归模式**: 深度优先遍历
 
 ```javascript
 // 桌面端: bruno-electron/src/ipc/network/index.js:1352-1366
-// CLI: bruno-cli/src/commands/run.js:620-639 (无 selectedRequestUids 过滤)
+//        按 selectedRequestUids 过滤和排序
+// CLI: bruno-cli/src/commands/run.js:637-639
+//      仅标签过滤，无 selectedRequestUids 过滤
 ```
 
 ### 3. 核心循环与跳转控制时序
@@ -320,6 +397,7 @@ RunConfigurationPanel 加载请求列表
 ```
   ┌─────────────────────────────────────────────────────────────┐
   │  WHILE (currentRequestIndex < folderRequests.length)        │
+  │  line 1370                                                  │
   └─────────────────────────────────────────────────────────────┘
     ↓ 1372-1376
   ┌─────────────────────────────────────────────────────────────┐
@@ -360,7 +438,7 @@ RunConfigurationPanel 加载请求列表
   ┌─────────────────────────────────────────────────────────────┐
   │  🔴 Pre-request 脚本执行                                    │
   │     → 捕获错误，提取 partialResults                         │
-  │     → appendScriptErrorResult() 追加错误结果                │
+  │     → appendScriptErrorResult() 追加错误结果 (line 1480)  │
   │     → 发送 'test-results-pre-request'                       │
   │     → 发送脚本执行通知                                       │
   │     → 有错误 → throw → 进入 catch                           │
@@ -395,7 +473,7 @@ RunConfigurationPanel 加载请求列表
   ┌─────────────────────────────────────────────────────────────┐
   │  🟢 Post-response 脚本执行                                  │
   │     → 捕获错误，提取 partialResults                         │
-  │     → appendScriptErrorResult() 追加错误结果                │
+  │     → appendScriptErrorResult() 追加错误结果 (line 1724)  │
   │     → 发送脚本执行通知                                       │
   └─────────────────────────────────────────────────────────────┘
     ↓ 1739-1741
@@ -420,7 +498,7 @@ RunConfigurationPanel 加载请求列表
   ┌─────────────────────────────────────────────────────────────┐
   │  🧪 执行 Tests 脚本                                        │
   │     → 捕获错误，提取 partialResults                         │
-  │     → appendScriptErrorResult() 追加错误结果                │
+  │     → appendScriptErrorResult() 追加错误结果 (line 1815)  │
   └─────────────────────────────────────────────────────────────┘
     ↓ 1817-1819
   ┌─────────────────────────────────────────────────────────────┐
@@ -446,56 +524,62 @@ RunConfigurationPanel 加载请求列表
     ↓ 1875-1892
   ┌─────────────────────────────────────────────────────────────┐
   │  🎯 跳转决策                                                │
-  │     ├─ nextRequestName === null → break 终止                │
+  │     ├─ nextRequestName === null → break 终止 (line 1882)  │
   │     ├─ nextRequestName 存在且找到 → 跳转到指定 index        │
+  │     │  (line 1883: findIndex, line 1885: 赋值)            │
   │     ├─ nextRequestName 不存在找不到 → index++ 顺序执行      │
-  │     └─ 未设置 nextRequestName → index++ 顺序执行            │
+  │     │  (line 1888)                                         │
+  │     └─ 未设置 nextRequestName → index++ 顺序执行 (line 1891)│
   └─────────────────────────────────────────────────────────────┘
-    ↓ 循环结束
+    ↓ 1893 循环结束
   ┌─────────────────────────────────────────────────────────────┐
   │  📨 发送 'testrun-ended' 事件 (正常结束)                    │
   └─────────────────────────────────────────────────────────────┘
 ```
 
-**CLI 精确执行时序** (`bruno-cli/src/commands/run.js:668-753`):
+**CLI 精确执行时序** (`bruno-cli/src/commands/run.js:680-765`):
 
 ```
   ┌─────────────────────────────────────────────────────────────┐
   │  WHILE (currentRequestIndex < requestItems.length)        │
+  │  line 682                                                  │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 675-687
+    ↓ 687-699
   ┌─────────────────────────────────────────────────────────────┐
   │  📦 runSingleRequest() 执行单个请求                        │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 691-694
+    ↓ 701-710
   ┌─────────────────────────────────────────────────────────────┐
-  │  ⏱️ 延迟处理 (--delay 参数)                                  │
+  │  ⏱️ 延迟处理 (--delay 参数) (line 703-706)                │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 700-706
+    ↓ 712-718
   ┌─────────────────────────────────────────────────────────────┐
-  │  📊 收集执行结果                                        │
+  │  📊 收集执行结果到 results 数组                              │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 715-725
+    ↓ 727-737
   ┌─────────────────────────────────────────────────────────────┐
   │  🛑 --bail 终止检查 (遇错即停)                              │
-  │     → 有失败 → break 终止                                  │
+  │     → 检测 requestFailure/testFailure/assertionFailure等  │
+  │     → 有失败 → break 终止 (line 735)                       │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 728
+    ↓ 740
   ┌─────────────────────────────────────────────────────────────┐
-  │  🎯 获取 nextRequestName                                    │
+  │  🎯 获取 nextRequestName (line 740)                         │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 730-732
+    ↓ 742-744
   ┌─────────────────────────────────────────────────────────────┐
   │  🛑 shouldStopRunnerExecution 终止                            │
   │     → break 退出循环                                        │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 734-752
+    ↓ 746-764
   ┌─────────────────────────────────────────────────────────────┐
   │  🎯 跳转决策                                                │
-  │     ├─ nextRequestName === null → break 终止                │
+  │     ├─ nextRequestName === null → break 终止 (line 753)   │
   │     ├─ nextRequestName 存在且找到 → 跳转到指定 index        │
+  │     │  (line 755: findIndex, line 757: 赋值)               │
   │     ├─ nextRequestName 不存在找不到 → index++ 顺序执行      │
-  │     └─ 未设置 nextRequestName → index++ 顺序执行            │
+  │     │  (line 760)                                          │
+  │     └─ 未设置 nextRequestName → index++ 顺序执行 (line 763)│
   └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -516,9 +600,9 @@ bru.setNextRequest(null);
 bru.stopRunner(); // 等价于 setNextRequest(null)
 ```
 
-**跳转查找逻辑**:
+**跳转查找逻辑（精确行号）**:
 - **桌面端**: `bruno-electron/src/ipc/network/index.js:1883`
-- **CLI**: `bruno-cli/src/commands/run.js:743`
+- **CLI**: `bruno-cli/src/commands/run.js:755`
 
 ```javascript
 const nextRequestIdx = folderRequests.findIndex((request) => request.name === nextRequestName);
@@ -526,9 +610,9 @@ const nextRequestIdx = folderRequests.findIndex((request) => request.name === ne
 - **按名称匹配**: `request.name` 完全匹配（大小写敏感）
 - **未找到**: 输出 `console.error`，顺序执行下一个
 
-**无限循环防护**:
-- **桌面端**: `line 1877`
-- **CLI**: `line 735-739`
+**无限循环防护（精确行号）**:
+- **桌面端**: `bruno-electron/src/ipc/network/index.js:1877`
+- **CLI**: `bruno-cli/src/commands/run.js:747-751`
 
 ```javascript
 nJumps++;
@@ -636,7 +720,7 @@ catch (error) {
     ↓ 存在
 preRequestScriptResult = partialResults
     ↓
-preRequestScriptResult = appendScriptErrorResult()
+preRequestScriptResult = appendScriptErrorResult() (line 1480)
     ↓
 发送 'test-results-pre-request' 事件
     ↓
@@ -717,7 +801,7 @@ catch (error) {
     ↓ 存在
 postResponseScriptResult = partialResults
     ↓
-postResponseScriptResult = appendScriptErrorResult()
+postResponseScriptResult = appendScriptErrorResult() (line 1724)
     ↓
 发送脚本执行通知 (含错误信息)
     ↓
@@ -739,9 +823,9 @@ postResponseScriptResult = appendScriptErrorResult()
 
 ### 5. Tests 脚本错误分支
 
-**桌面端精确时序** (`bruno-electron/src/ipc/network/index.js:1798-1813`):
+**桌面端精确时序** (`bruno-electron/src/ipc/network/index.js:1777-1853`):
 ```
-try { testRuntime.runTests() }
+try { testRuntime.runTests() } (line 1785)
     ↓
 catch (error) {
     testError = error
@@ -752,7 +836,7 @@ catch (error) {
     }
 }
     ↓
-testResults = appendScriptErrorResult()
+testResults = appendScriptErrorResult() (line 1815)
     ↓
 发送 'test-results' 事件
     ↓
@@ -763,50 +847,68 @@ testResults = appendScriptErrorResult()
 
 ### 6. Runner 级终止分支
 
-**终止触发条件**:
+**终止触发条件（精确行号）**:
 
 | 触发方式 | 桌面端位置 | CLI 位置 | 状态文本 |
 |---------|---------|---------|---------|
-| `bru.stopRunner()` | `line 1863` | `line 730-732` | `collection run was terminated!` (仅桌面端) |
-| `bru.setNextRequest(null)` | `line 1880` | `line 740` | break 终止 |
-| 用户点击 Cancel | UI 操作 | 无 | 无状态文本 |
-| 跳转超过 10000 次 | `line 1877` | `line 735-739` | 抛出异常 |
-| `--bail` 遇错即停 | 无 | `line 715-725` | break 终止 |
+| `bru.stopRunner()` | `line 1863-1873` | `line 742-744` | `collection run was terminated!` (仅桌面端) |
+| `bru.setNextRequest(null)` | `line 1880-1882` | `line 752-753` | break 终止 |
+| 用户点击 Cancel | UI 操作 → `line 1372-1376` | 无 | 抛出 Error(isCancel=true) |
+| 跳转超过 10000 次 | `line 1877-1879` | `line 747-751` | 抛出异常 / process.exit |
+| `--bail` 遇错即停 | 无 | `line 727-737` | break 终止 |
 
 ---
 
 ## 核心代码位置汇总
 
-| 功能模块 | 文件路径 | 桌面端行号 | CLI 行号 |
-|---------|---------|---------|---------|
+| 功能模块 | 文件路径 | 桌面端精确行号 | CLI 精确行号 |
+|---------|---------|-------------|-----------|
 | Runner 主循环 | `bruno-electron/src/ipc/network/index.js` | 1368-1893 | - |
-| Runner 主循环 (CLI) | `bruno-cli/src/commands/run.js` | - | 668-753 |
-| 请求跳转逻辑 | `bruno-electron/src/ipc/network/index.js` | 1875-1892 | - |
-| 请求跳转逻辑 (CLI) | `bruno-cli/src/commands/run.js` | - | 734-752 |
-| Pre-request 执行 | `bruno-electron/src/ipc/network/index.js` | 1456-1505 | - |
+| Runner 主循环 (CLI) | `bruno-cli/src/commands/run.js` | - | 680-765 |
+| while 循环开始 | 同上 | line 1370 | line 682 |
+| 请求跳转决策 | 同上 | 1875-1892 | - |
+| 请求跳转决策 (CLI) | `bruno-cli/src/commands/run.js` | - | 746-764 |
+| 跳转查找 findIndex | 同上 | line 1883 | line 755 |
+| 无限循环防护 | 同上 | line 1877-1879 | line 747-751 |
+| setNextRequest(null) 终止 | 同上 | line 1880-1882 | line 752-753 |
+| shouldStopRunnerExecution 终止 | 同上 | line 1863-1873 | line 742-744 |
+| 取消信号检查 | 同上 | line 1372-1376 | - |
+| --bail 遇错即停 | 无 | - | line 727-737 |
+| 延迟处理 | 同上 | line 1532 附近 | line 703-706 |
+| 结果收集 | 同上 | - | line 712-718 |
+| Pre-request 执行 | 同上 | 1456-1505 | - |
 | Pre-request 执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 130-240 |
-| Post-response 执行 | `bruno-electron/src/ipc/network/index.js` | 1697-1754 | - |
-| Post-response 执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 720-820 |
-| HTTP 请求错误处理 | `bruno-electron/src/ipc/network/index.js` | 1650-1694 | - |
-| HTTP 请求错误处理 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 500-670 |
-| 错误结果追加 | `bruno-electron/src/ipc/network/index.js` | 471-502 | - |
-| Tests 脚本执行 | `bruno-electron/src/ipc/network/index.js` | 1777-1853 | - |
-| Tests 脚本执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 830-890 |
-| Assertions 执行 | `bruno-electron/src/ipc/network/index.js` | 1756-1775 | - |
-| Assertions 执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 821-828 |
+| Pre-request 错误捕获 | 同上 | line 1456 附近 | line 241-298 |
+| Post-response 执行 | 同上 | 1697-1754 | - |
+| Post-response 执行 (CLI) | 同上 | - | 720-820 |
+| HTTP 请求发送 | 同上 | 1532-1694 | - |
+| HTTP 请求错误处理 | 同上 | 1650-1694 | - |
+| HTTP 请求处理 (CLI) | 同上 | - | 500-670 |
+| 错误结果追加函数定义 | 同上 | 471-502 | - |
+| 错误结果追加(Pre) | 同上 | line 1480 | - |
+| 错误结果追加(Post) | 同上 | line 1724 | - |
+| 错误结果追加(Test) | 同上 | line 1815 | - |
+| Tests 脚本执行 | 同上 | 1777-1853 | - |
+| Tests 脚本执行 (CLI) | 同上 | - | 830-890 |
+| testRuntime.runTests 调用 | 同上 | line 1785 | - |
+| Assertions 执行 | 同上 | 1756-1775 | - |
+| Assertions 执行 (CLI) | 同上 | - | 821-828 |
+| 跳过 gRPC 请求 | 同上 | 1398-1413 | - |
+| 跳过 Prompt 变量请求 | 同上 | 1420-1439 | - |
+| 标签过滤 | 同上 | 1343-1350 | - |
+| 标签过滤 (CLI) | `bruno-cli/src/commands/run.js` | - | 637-639 |
+| 选中请求过滤/排序 | 同上 | 1352-1366 | - |
 | Runner 配置面板 | `bruno-app/src/components/RunnerResults/RunConfigurationPanel/index.jsx` | 1-450 | - |
 | Runner 结果面板 | `bruno-app/src/components/RunnerResults/index.jsx` | 1-566 | - |
 | CLI 命令定义 | `bruno-cli/src/commands/run.js` | - | 112-307 |
 | Runner 类型定义 | `bruno-common/src/runner/types/index.ts` | 1-125 | 1-125 |
-| 单请求执行 (桌面端) | `bruno-electron/src/ipc/network/index.js` | 737-1158 | - |
+| 单请求执行函数 | `bruno-electron/src/ipc/network/index.js` | 737-1158 | - |
 | 单请求执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 1-950 |
+| nextRequestName 变量传递 | 同上 | - | line 134, 232, 287, 324, 726, 776, 807, 854, 884, 925 |
 | prepareRequest (桌面端) | `bruno-electron/src/ipc/network/prepare-request.js` | 1-150 | - |
 | prepareRequest (CLI) | `bruno-cli/src/runner/prepare-request.js` | - | 1-100 |
 | 变量插值 (桌面端) | `bruno-electron/src/ipc/network/interpolate-vars.js` | 1-100 | - |
 | 变量插值 (CLI) | `bruno-cli/src/runner/interpolate-vars.js` | - | 1-80 |
-| 标签过滤 (桌面端) | `bruno-electron/src/ipc/network/index.js` | 1343-1350 | - |
-| 标签过滤 (CLI) | `bruno-cli/src/commands/run.js` | - | 637-639 |
-| 选中请求过滤 | `bruno-electron/src/ipc/network/index.js` | 1352-1366 | - |
 
 ---
 
@@ -832,15 +934,15 @@ iterationData?: any; // todo - csv/json row data
 - 单请求执行无 iterationData 注入
 - `T_RunnerRequestExecutionResult.iterationIndex` 始终为 0
 
-### ✅ 3. 请求跳转功能（已实现）
+### ✅ 3. 请求跳转功能（已实现，行号已核对）
 **文档预期**: 支持 `bru.setNextRequest()` 跳转
-**实际实现**:
+**实际实现（精确行号已核对）**:
 - ✅ 两套 Runner 均完整实现跳转功能
-- ✅ Pre-request 脚本中可设置
-- ✅ Post-response 脚本中可设置
-- ✅ Tests 脚本中可设置
-- ✅ 支持 `setNextRequest(null)` 终止执行
-- ✅ 10000 次跳转防无限循环
+- ✅ Pre-request 脚本中可设置（桌面端 line 1507-1509）
+- ✅ Post-response 脚本中可设置（桌面端 line 1739-1741）
+- ✅ Tests 脚本中可设置（桌面端 line 1817-1819，最终生效）
+- ✅ 支持 `setNextRequest(null)` 终止执行（桌面端 line 1880-1882，CLI line 752-753）
+- ✅ 10000 次跳转防无限循环（桌面端 line 1877-1879，CLI line 747-751）
 
 ### ✅ 4. 变量注入机制（已实现）
 **文档预期**: 多层级变量覆盖，脚本中可修改变量
@@ -869,11 +971,11 @@ iterationData?: any; // todo - csv/json row data
 ┌─────────────────────────────────────────────────────────────────────┐
 │  🔁 开始请求循环 (WHILE)                                            │
 │     桌面端: bruno-electron/src/ipc/network/index.js:1368-1893       │
-│     CLI: bruno-cli/src/commands/run.js:668-753                      │
+│     CLI: bruno-cli/src/commands/run.js:680-765                      │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│  ✅ 检查取消信号 → ❌ 终止 (仅桌面端)                              │
+│  ✅ 检查取消信号 → ❌ 终止 (仅桌面端 line 1372-1376)               │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -910,7 +1012,7 @@ iterationData?: any; // todo - csv/json row data
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │  🧪 执行 Tests 脚本                                                │
-│     ├─ ✅ 成功 → 提取 nextRequestName / stopExecution               │
+│     ├─ ✅ 成功 → 提取 nextRequestName / stopExecution (最终生效)    │
 │     └─ ❌ 错误 → appendScriptErrorResult → ✅ 继续执行               │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
@@ -919,14 +1021,14 @@ iterationData?: any; // todo - csv/json row data
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│  🛑 stopRunnerExecution 检查 → true → break 终止                    │
-│  🛑 --bail 检查 (仅 CLI) → 有失败 → break 终止                        │
+│  🛑 stopRunnerExecution 检查 → true → break 终止 (line 1863-1873)  │
+│  🛑 --bail 检查 (仅 CLI line 727-737) → 有失败 → break 终止        │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│  🎯 跳转决策                                                        │
+│  🎯 跳转决策 (line 1875-1892 / CLI 746-764)                       │
 │     ├─ nextRequestName === null → break 终止                        │
-│     ├─ nextRequestName 存在 → 跳转到指定请求                        │
+│     ├─ nextRequestName 存在 → 跳转到指定请求 (findIndex line 1883) │
 │     └─ 未设置 / 找不到 → index++ 顺序执行                           │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
