@@ -684,7 +684,8 @@ if (hasOauth2GrantType) {
 | auth.* | request.auth.* | 完整认证配置 |
 | http/grpc/ws.auth | request.auth.mode | 当前选中的认证模式 |
 | body.* | request.body.* | 请求体内容 |
-| http/grpc/ws.body | request.body.mode | 当前选中的 body 模式 |
+| http.body | request.body.mode | 当前选中的 body 模式（仅 HTTP/GraphQL） |
+| 硬编码默认值 | request.body.mode | gRPC/WS 的 body.mode 默认值 |
 | params | request.params | 请求参数（仅 HTTP） |
 | script | request.script | 脚本对象 { req, res } |
 | vars | request.vars | 变量对象 { req, res } |
@@ -930,83 +931,25 @@ Filestore 层的归一化处理确保了：
 
 ---
 
-## 附录：三处关键事实修正与验证
+## 附录：关键行为分析索引
 
-### 修正 1：HTTP/GraphQL method 默认值
+### 已修正的关键事实
 
-| 项 | 内容 |
-|---|---|
-| **报告原说法** | HTTP 默认 GET，GraphQL 默认 POST |
-| **源码真实行为** | `String(_.get(json, 'http.method') ?? '').toUpperCase()` → 当 http.method 不存在时，结果为空字符串 `''` |
-| **修正后结论** | 所有非 gRPC 请求类型默认 method 都是空字符串 `''`，无 GET/POST 预设值 |
+本文档已针对以下三处关键行为进行修正，确保所有描述与源码行为一致：
 
-**最小示例验证**：
-```
-meta {
-  name: Test
-  type: http
-}
-http {
-  url: https://api.example.com
-}
-```
-解析结果：`request.method = ""`
+1. **HTTP/GraphQL method 默认值**：原文档表述为 HTTP 默认 GET、GraphQL 默认 POST，实际所有非 gRPC 请求默认 method 均为空字符串 `''`
+2. **ws-request 的 method 字段**：原文档认为 ws-request 无 method 字段，实际所有请求类型共享统一结构，method 字段被无条件设置，最终值为空字符串
+3. **gRPC/WS body.mode 来源**：原文档认为 body.mode 来自 `grpc.body`/`ws.body`，实际 mode 是硬编码在 `_.get` 的默认对象中，不读取上述字段
 
----
+### 深度分析报告
 
-### 修正 2：ws-request 是否包含 method 字段
+完整的源码分析、执行流程验证、最小可复现示例，请参考：
 
-| 项 | 内容 |
-|---|---|
-| **报告原说法** | ws-request 无 method 字段 |
-| **源码真实行为** | 所有请求类型共享同一 request 对象结构，method 在第 47-52 行被**无条件设置**。ws-request 走非 gRPC 分支，最终 method = 空字符串 |
-| **修正后结论** | ws-request **包含** method 字段，值为空字符串 `''` |
+**📄 `bru-parser-analysis.md`**
 
-**最小示例验证**：
-```
-meta {
-  name: WS Test
-  type: ws
-}
-ws {
-  url: wss://api.example.com
-}
-```
-解析结果：`'method' in request → true`, `request.method = ""`
-
----
-
-### 修正 3：gRPC 和 WS 的 body.mode 实际来源
-
-| 项 | 内容 |
-|---|---|
-| **报告原说法** | body.mode 来自 `json.grpc.body` / `json.ws.body` |
-| **源码真实行为** | `_.get(json, 'body', { mode: 'grpc', ... })` → mode 是硬编码在默认对象中，**从不读取** `grpc.body` 或 `ws.body`。后者仅用于 stringify 序列化 |
-| **修正后结论** | body.mode = `'grpc'` 或 `'ws'` 是硬编码默认值，与 `grpc.body`/`ws.body` 无关。若 Bru 有 body:* 块，则直接使用该 body 对象（可能缺少 mode 字段） |
-
-**最小示例验证（无 body 块）**：
-```
-meta {
-  name: gRPC Test
-  type: grpc
-}
-grpc {
-  url: grpc://localhost:50051
-}
-```
-解析结果：`body.mode = "grpc"`（来自硬编码默认对象）
-
-**有 body:json 块的特殊情况**：
-```
-meta {
-  name: gRPC With JSON
-  type: grpc
-}
-grpc {
-  url: grpc://localhost:50051
-}
-body:json {
-  {"hello": "world"}
-}
-```
-解析结果：`body = { json: "{\"hello\": \"world\"}" }`（**无 mode 字段**！）
+该报告包含：
+- 每处修正的三段对照（原有说法 → 源码真实行为 → 修正后结论）
+- 详细的执行流程断点分析
+- 6 个最小可复现 Bru 文件示例
+- 潜在问题识别与改进建议
+- 源码位置索引表
