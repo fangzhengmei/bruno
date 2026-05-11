@@ -563,34 +563,39 @@ if (requestType === 'grpc-request') {
 
 #### 6.6.1 Body Mode 映射
 
-| 请求类型 | body.mode 源字段 | 默认值 |
-|----------|-----------------|--------|
-| grpc-request | json.grpc.body | 'grpc' |
-| ws-request | json.ws.body | 'ws' |
-| http-request | json.http.body | 'none' |
-| graphql-request | json.http.body | 'none' |
+| 请求类型 | body.mode 来源 | 说明 |
+|----------|---------------|------|
+| grpc-request | 硬编码默认值 | 来自 `_.get(json, 'body', {...})` 的第二个参数，**不读取** `json.grpc.body` |
+| ws-request | 硬编码默认值 | 来自 `_.get(json, 'body', {...})` 的第二个参数，**不读取** `json.ws.body` |
+| http-request | json.http.body | 显式读取 http.body 字段设置 mode |
+| graphql-request | json.http.body | 显式读取 http.body 字段设置 mode |
+
+> **注意**：gRPC 和 WS 的 body.mode **不来自** `grpc.body` 或 `ws.body`！
+> - 无 body 块时：使用硬编码默认对象，mode = 'grpc' 或 'ws'
+> - 有 body:* 块时：直接使用该 body 对象，**可能缺少 mode 字段**（如 body:json 只有 json 字段）
+> - `grpc.body` 和 `ws.body` 仅用于 **stringify 序列化**时写入 Bru 文件
 
 #### 6.6.2 Body 内容分支逻辑
 
 ```javascript
 if (requestType === 'grpc-request') {
-  // gRPC 请求体：消息数组格式
+  // gRPC 请求体：使用硬编码默认结构，不读取 grpc.body
   transformedJson.request.body = _.get(json, 'body', {
-    mode: 'grpc',
+    mode: 'grpc',  // ← 硬编码默认值
     grpc: _.get(json, 'body.grpc', [
       { name: 'message 1', content: '{}' }
     ])
   });
 } else if (requestType === 'ws-request') {
-  // WebSocket 请求体：消息数组格式
+  // WebSocket 请求体：使用硬编码默认结构，不读取 ws.body
   transformedJson.request.body = _.get(json, 'body', {
-    mode: 'ws',
+    mode: 'ws',  // ← 硬编码默认值
     ws: _.get(json, 'body.ws', [
       { name: 'message 1', content: '{}' }
     ])
   });
 } else {
-  // HTTP / GraphQL：标准 body 对象
+  // HTTP / GraphQL：显式读取 http.body 设置 mode
   transformedJson.request.body = _.get(json, 'body', {});
   transformedJson.request.body.mode = _.get(json, 'http.body', 'none');
 }
@@ -922,3 +927,86 @@ Filestore 层的归一化处理确保了：
 - 完整的双向转换（Bru ↔ JSON）
 - 良好的扩展性和可维护性
 - 统一的请求对象结构便于执行层处理
+
+---
+
+## 附录：三处关键事实修正与验证
+
+### 修正 1：HTTP/GraphQL method 默认值
+
+| 项 | 内容 |
+|---|---|
+| **报告原说法** | HTTP 默认 GET，GraphQL 默认 POST |
+| **源码真实行为** | `String(_.get(json, 'http.method') ?? '').toUpperCase()` → 当 http.method 不存在时，结果为空字符串 `''` |
+| **修正后结论** | 所有非 gRPC 请求类型默认 method 都是空字符串 `''`，无 GET/POST 预设值 |
+
+**最小示例验证**：
+```
+meta {
+  name: Test
+  type: http
+}
+http {
+  url: https://api.example.com
+}
+```
+解析结果：`request.method = ""`
+
+---
+
+### 修正 2：ws-request 是否包含 method 字段
+
+| 项 | 内容 |
+|---|---|
+| **报告原说法** | ws-request 无 method 字段 |
+| **源码真实行为** | 所有请求类型共享同一 request 对象结构，method 在第 47-52 行被**无条件设置**。ws-request 走非 gRPC 分支，最终 method = 空字符串 |
+| **修正后结论** | ws-request **包含** method 字段，值为空字符串 `''` |
+
+**最小示例验证**：
+```
+meta {
+  name: WS Test
+  type: ws
+}
+ws {
+  url: wss://api.example.com
+}
+```
+解析结果：`'method' in request → true`, `request.method = ""`
+
+---
+
+### 修正 3：gRPC 和 WS 的 body.mode 实际来源
+
+| 项 | 内容 |
+|---|---|
+| **报告原说法** | body.mode 来自 `json.grpc.body` / `json.ws.body` |
+| **源码真实行为** | `_.get(json, 'body', { mode: 'grpc', ... })` → mode 是硬编码在默认对象中，**从不读取** `grpc.body` 或 `ws.body`。后者仅用于 stringify 序列化 |
+| **修正后结论** | body.mode = `'grpc'` 或 `'ws'` 是硬编码默认值，与 `grpc.body`/`ws.body` 无关。若 Bru 有 body:* 块，则直接使用该 body 对象（可能缺少 mode 字段） |
+
+**最小示例验证（无 body 块）**：
+```
+meta {
+  name: gRPC Test
+  type: grpc
+}
+grpc {
+  url: grpc://localhost:50051
+}
+```
+解析结果：`body.mode = "grpc"`（来自硬编码默认对象）
+
+**有 body:json 块的特殊情况**：
+```
+meta {
+  name: gRPC With JSON
+  type: grpc
+}
+grpc {
+  url: grpc://localhost:50051
+}
+body:json {
+  {"hello": "world"}
+}
+```
+解析结果：`body = { json: "{\"hello\": \"world\"}" }`（**无 mode 字段**！）
