@@ -19,8 +19,8 @@ Bruno 的 Collection Runner 有两套独立实现，共享核心逻辑一致：
 
 | 版本 | 核心执行文件 | 循环起始行号 |
 |-----|-------------|----------|
-| **CLI 版本** | `bruno-cli/src/commands/run.js` | `line 680-765 |
-| **桌面端版本** | `bruno-electron/src/ipc/network/index.js` | `line 1368-1893 |
+| **CLI 版本** | `bruno-cli/src/commands/run.js` | `line 668-753` |
+| **桌面端版本** | `bruno-electron/src/ipc/network/index.js` | `line 1368-1893` |
 
 ### 主要组件：
 - **触发入口**: `bruno-app/src/components/Sidebar/Collections/Collection/CollectionItem/RunCollectionItem/index.js`
@@ -103,12 +103,12 @@ bruno run folder --bail               # 遇错即停
 
 **CLI 循环实现**:
 ```javascript
-// bruno-cli/src/commands/run.js:680-765
+// bruno-cli/src/commands/run.js:668-753
 let currentRequestIndex = 0;
 let nJumps = 0; // count the number of jumps to avoid infinite loops
 while (currentRequestIndex < requestItems.length) {
   // 仅请求级循环，无外层数据迭代循环
-  // line 746-764: 跳转逻辑
+  // line 734-752: 跳转逻辑
 }
 ```
 
@@ -136,36 +136,36 @@ while (currentRequestIndex < folderRequests.length) {
 
 ### CLI 核心循环
 **文件**: `bruno-cli/src/commands/run.js`
-**行号**: `line 680-765`
+**行号**: `line 668-753`
 
 ```javascript
-// line 680-681: 循环初始化
+// line 668-669: 循环初始化
 let currentRequestIndex = 0;
 let nJumps = 0; // count the number of jumps to avoid infinite loops
 
-// line 682: while 循环开始
+// line 670: while 循环开始
 while (currentRequestIndex < requestItems.length) {
 
-  // line 687-699: 执行单个请求
+  // line 675-687: 执行单个请求
   const result = await runSingleRequest(...);
 
-  // line 703-706: 延迟处理
+  // line 691-694: 延迟处理
   if (isValidDelay && !isLastRun) {
     await new Promise((resolve) => setTimeout(resolve, delay));
   }
 
-  // line 727-737: --bail 终止逻辑
+  // line 715-725: --bail 终止逻辑
   if (bail) { /* ... */ break; }
 
-  // line 740: 获取下一个请求名
+  // line 728: 获取下一个请求名
   const nextRequestName = result?.nextRequestName;
 
-  // line 742-744: stopRunner 终止
+  // line 730-732: stopRunner 终止
   if (result?.shouldStopRunnerExecution) {
     break;
   }
 
-  // line 746-764: 跳转决策
+  // line 734-752: 跳转决策
   if (nextRequestName !== undefined) {
     nJumps++;
     if (nJumps > 10000) { /* 无限循环防护 */ }
@@ -185,6 +185,12 @@ while (currentRequestIndex < requestItems.length) {
 ### CLI 单请求执行
 **文件**: `bruno-cli/src/runner/run-single-request.js`
 **职责**: 执行单个 HTTP 请求，包括脚本执行，变量插值
+**关键行号**:
+- Pre-request 脚本: `line 130-240`
+- Post-response 脚本: `line 720-820`
+- Tests 脚本: `line 830-890`
+- Assertions: `line 821-828`
+- 跳转名称传递: `line 134-135, 232-237, 272, 285-292, 324-325, 726-727, 775-780, 806-811, 853-858, 883-888, 925-926`
 
 ---
 
@@ -205,7 +211,7 @@ while (currentRequestIndex < folderRequests.length) {
   // line 1372-1376: 检查取消信号
   if (abortController.signal.aborted) { throw error; }
 
-  // line 1397-1413: 跳过 gRPC 请求
+  // line 1398-1413: 跳过 gRPC 请求
   if (item.type === 'grpc-request') { /* ... */ continue; }
 
   // line 1420-1439: 跳过含 Prompt 变量的请求
@@ -244,7 +250,7 @@ while (currentRequestIndex < folderRequests.length) {
 
 ### 桌面端 IPC 通信层
 **文件**: `bruno-electron/src/ipc/network/index.js`
-**行号**: `line 1273-1914` (renderer:run-collection-folder handler
+**行号**: `line 1273-1914` (renderer:run-collection-folder handler)
 
 ### 桌面端 UI 触发层
 **文件**: `bruno-app/src/components/RunnerResults/RunConfigurationPanel/index.jsx`
@@ -256,7 +262,7 @@ while (currentRequestIndex < folderRequests.length) {
 
 ### 1. 初始化阶段 (Collection Runner 启动)
 
-**桌面端执行流程**：
+**桌面端执行流程**:
 ```
 用户点击 Run 按钮
     ↓
@@ -279,7 +285,7 @@ RunConfigurationPanel 加载请求列表
 发送 'testrun-started' 事件到 UI
 ```
 
-**CLI 执行流程**：
+**CLI 执行流程**:
 ```
 用户执行 bruno run 命令 (bruno-cli/src/commands/run.js:309)
     ↓
@@ -289,9 +295,9 @@ RunConfigurationPanel 加载请求列表
     ↓
 收集请求列表 (递归 / 非递归)
     ↓
-应用标签过滤
+应用标签过滤 (line 637-639)
     ↓
-开始执行请求循环 (line 680)
+开始执行请求循环 (line 668)
 ```
 
 ### 2. 请求收集与排序
@@ -304,12 +310,12 @@ RunConfigurationPanel 加载请求列表
 
 ```javascript
 // 桌面端: bruno-electron/src/ipc/network/index.js:1352-1366
-// CLI: bruno-cli/src/commands/run.js:620-639 (无 selectedRequestUids 过滤
+// CLI: bruno-cli/src/commands/run.js:620-639 (无 selectedRequestUids 过滤)
 ```
 
 ### 3. 核心循环与跳转控制时序
 
-**桌面端精确执行时序** (`bruno-electron/src/ipc/network/index.js:1368-1893):
+**桌面端精确执行时序** (`bruno-electron/src/ipc/network/index.js:1368-1893`):
 
 ```
   ┌─────────────────────────────────────────────────────────────┐
@@ -408,11 +414,11 @@ RunConfigurationPanel 加载请求列表
   └─────────────────────────────────────────────────────────────┘
     ↓ 1756-1775
   ┌─────────────────────────────────────────────────────────────┐
-  │  ✅ 执行 Assertions → 记录结果                                      │
+  │  ✅ 执行 Assertions → 记录结果                              │
   └─────────────────────────────────────────────────────────────┘
     ↓ 1777-1853
   ┌─────────────────────────────────────────────────────────────┐
-  │  🧪 执行 Tests 脚本                                                │
+  │  🧪 执行 Tests 脚本                                        │
   │     → 捕获错误，提取 partialResults                         │
   │     → appendScriptErrorResult() 追加错误结果                │
   └─────────────────────────────────────────────────────────────┘
@@ -451,39 +457,39 @@ RunConfigurationPanel 加载请求列表
   └─────────────────────────────────────────────────────────────┘
 ```
 
-**CLI 精确执行时序** (`bruno-cli/src/commands/run.js:680-765`):
+**CLI 精确执行时序** (`bruno-cli/src/commands/run.js:668-753`):
 
 ```
   ┌─────────────────────────────────────────────────────────────┐
   │  WHILE (currentRequestIndex < requestItems.length)        │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 687-699
+    ↓ 675-687
   ┌─────────────────────────────────────────────────────────────┐
   │  📦 runSingleRequest() 执行单个请求                        │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 703-706
+    ↓ 691-694
   ┌─────────────────────────────────────────────────────────────┐
-  │  ⏱️ 延迟处理 (--delay 参数                                  │
+  │  ⏱️ 延迟处理 (--delay 参数)                                  │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 712-718
+    ↓ 700-706
   ┌─────────────────────────────────────────────────────────────┐
   │  📊 收集执行结果                                        │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 727-737
+    ↓ 715-725
   ┌─────────────────────────────────────────────────────────────┐
   │  🛑 --bail 终止检查 (遇错即停)                              │
   │     → 有失败 → break 终止                                  │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 740
+    ↓ 728
   ┌─────────────────────────────────────────────────────────────┐
   │  🎯 获取 nextRequestName                                    │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 742-744
+    ↓ 730-732
   ┌─────────────────────────────────────────────────────────────┐
   │  🛑 shouldStopRunnerExecution 终止                            │
   │     → break 退出循环                                        │
   └─────────────────────────────────────────────────────────────┘
-    ↓ 746-764
+    ↓ 734-752
   ┌─────────────────────────────────────────────────────────────┐
   │  🎯 跳转决策                                                │
   │     ├─ nextRequestName === null → break 终止                │
@@ -500,7 +506,7 @@ RunConfigurationPanel 加载请求列表
 2. Post-response 脚本设置 → 覆盖 Pre-request 的设置
 3. Tests 脚本设置 → 最后设置，最终生效
 
-**跳转 API**：
+**跳转 API**:
 ```javascript
 // 跳转到指定请求名称
 bru.setNextRequest('Request Name');
@@ -510,9 +516,9 @@ bru.setNextRequest(null);
 bru.stopRunner(); // 等价于 setNextRequest(null)
 ```
 
-**跳转查找逻辑**：
-- **桌面端**: `bruno-electron/src/ipc/network/index.js:1883
-- **CLI**: `bruno-cli/src/commands/run.js:755`
+**跳转查找逻辑**:
+- **桌面端**: `bruno-electron/src/ipc/network/index.js:1883`
+- **CLI**: `bruno-cli/src/commands/run.js:743`
 
 ```javascript
 const nextRequestIdx = folderRequests.findIndex((request) => request.name === nextRequestName);
@@ -520,9 +526,9 @@ const nextRequestIdx = folderRequests.findIndex((request) => request.name === ne
 - **按名称匹配**: `request.name` 完全匹配（大小写敏感）
 - **未找到**: 输出 `console.error`，顺序执行下一个
 
-**无限循环防护**：
+**无限循环防护**:
 - **桌面端**: `line 1877`
-- **CLI**: `line 747-751`
+- **CLI**: `line 735-739`
 
 ```javascript
 nJumps++;
@@ -565,7 +571,7 @@ Process Environment Variables (系统环境) ← 进程环境变量
 
 #### 2. Pre-request 脚本执行后
 **桌面端位置**: `bruno-electron/src/ipc/network/index.js:runPreRequest()`
-**CLI 位置**: `bruno-cli/src/runner/run-single-request.js`
+**CLI 位置**: `bruno-cli/src/runner/run-single-request.js:130-240`
 - 脚本中通过 `bru.setEnvVar()` / `bru.setVar()` 修改变量
 - **桌面端**: 执行完成后发送 `script-environment-update` 事件同步到 UI
 - **注意**: 此阶段修改的变量会影响当前请求的插值
@@ -579,12 +585,12 @@ Process Environment Variables (系统环境) ← 进程环境变量
 
 #### 4. Post-response 脚本执行后
 **桌面端位置**: `bruno-electron/src/ipc/network/index.js:runPostResponse()`
-**CLI 位置**: `bruno-cli/src/runner/run-single-request.js`
+**CLI 位置**: `bruno-cli/src/runner/run-single-request.js:720-820`
 - 脚本中修改的变量影响**后续请求**，不影响当前请求
 
 #### 5. Tests 脚本执行后
 **桌面端位置**: `bruno-electron/src/ipc/network/index.js:1827-1837`
-**CLI 位置**: `bruno-cli/src/runner/run-single-request.js`
+**CLI 位置**: `bruno-cli/src/runner/run-single-request.js:830-890`
 - 最后一次变量更新机会
 - 桌面端发送 `script-environment-update` 同步到 UI
 - 影响后续所有请求
@@ -641,8 +647,9 @@ if (preRequestError) {
 }
 ```
 
-**CLI 精确时序** (`bruno-cli/src/runner/run-single-request.js`):
+**CLI 精确时序** (`bruno-cli/src/runner/run-single-request.js:130-240`):
 - 逻辑与桌面端一致
+- 错误捕获位置: `line 241-298`
 
 **appendScriptErrorResult 逻辑** (`bruno-electron/src/ipc/network/index.js:471-502`):
 ```javascript
@@ -668,7 +675,7 @@ if (axios.isCancel(error)) {
 
 **分支 2: 服务器返回 4XX/5XX**
 - **桌面端**: `bruno-electron/src/ipc/network/index.js:1656-1689`
-- **CLI**: `bruno-cli/src/runner/run-single-request.js`
+- **CLI**: `bruno-cli/src/runner/run-single-request.js:500-650`
 
 ```
 有 error.response 对象
@@ -685,7 +692,7 @@ if (axios.isCancel(error)) {
 
 **分支 3: 网络错误 / DNS 错误**
 - **桌面端**: `bruno-electron/src/ipc/network/index.js:1690-1693`
-- **CLI**: `bruno-cli/src/runner/run-single-request.js`
+- **CLI**: `bruno-cli/src/runner/run-single-request.js:651-670`
 
 ```
 无 error.response 对象
@@ -719,10 +726,12 @@ postResponseScriptResult = appendScriptErrorResult()
 
 **关键差异**: Post-response 脚本错误**不会终止**当前请求的后续流程
 
+**CLI 实现位置**: `bruno-cli/src/runner/run-single-request.js:720-820`
+
 ### 4. Assertions 断言失败分支
 
 **位置**: `bruno-electron/src/ipc/network/index.js:1756-1775` (桌面端)
-**位置**: `bruno-cli/src/runner/run-single-request.js` (CLI)
+**位置**: `bruno-cli/src/runner/run-single-request.js:821-828` (CLI)
 - 断言失败仅记录到 `assertionResults`
 - 不会抛出异常
 - 不会终止 Tests 脚本执行
@@ -750,17 +759,19 @@ testResults = appendScriptErrorResult()
 ✅ 继续下一个请求
 ```
 
+**CLI 实现位置**: `bruno-cli/src/runner/run-single-request.js:830-890`
+
 ### 6. Runner 级终止分支
 
-**终止触发条件**：
+**终止触发条件**:
 
 | 触发方式 | 桌面端位置 | CLI 位置 | 状态文本 |
 |---------|---------|---------|---------|
-| `bru.stopRunner()` | `line 1863` | `line 742-744` | `collection run was terminated!` (仅桌面端)
-| `bru.setNextRequest(null)` | `line 1880` | `line 752` | break 终止
-| 用户点击 Cancel | UI 操作 | 无 | 无状态文本
-| 跳转超过 10000 次 | `line 1877` | `line 747-751` | 抛出异常
-| `--bail` 遇错即停 | 无 | `line 727-737` | break 终止
+| `bru.stopRunner()` | `line 1863` | `line 730-732` | `collection run was terminated!` (仅桌面端) |
+| `bru.setNextRequest(null)` | `line 1880` | `line 740` | break 终止 |
+| 用户点击 Cancel | UI 操作 | 无 | 无状态文本 |
+| 跳转超过 10000 次 | `line 1877` | `line 735-739` | 抛出异常 |
+| `--bail` 遇错即停 | 无 | `line 715-725` | break 终止 |
 
 ---
 
@@ -769,23 +780,33 @@ testResults = appendScriptErrorResult()
 | 功能模块 | 文件路径 | 桌面端行号 | CLI 行号 |
 |---------|---------|---------|---------|
 | Runner 主循环 | `bruno-electron/src/ipc/network/index.js` | 1368-1893 | - |
-| Runner 主循环 (CLI) | `bruno-cli/src/commands/run.js` | - | 680-765 |
-| 请求跳转逻辑 | `同上` | 1875-1892 | 746-764 |
-| 请求跳转逻辑 (CLI) | `同上` | - | 746-764 |
-| Pre-request 执行 | `同上` | 1456-1505 | run-single-request.js |
-| Post-response 执行 | `同上` | 1697-1754 | run-single-request.js |
-| HTTP 请求错误处理 | `同上` | 1650-1694 | run-single-request.js |
-| 错误结果追加 | `同上` | 471-502 | - |
+| Runner 主循环 (CLI) | `bruno-cli/src/commands/run.js` | - | 668-753 |
+| 请求跳转逻辑 | `bruno-electron/src/ipc/network/index.js` | 1875-1892 | - |
+| 请求跳转逻辑 (CLI) | `bruno-cli/src/commands/run.js` | - | 734-752 |
+| Pre-request 执行 | `bruno-electron/src/ipc/network/index.js` | 1456-1505 | - |
+| Pre-request 执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 130-240 |
+| Post-response 执行 | `bruno-electron/src/ipc/network/index.js` | 1697-1754 | - |
+| Post-response 执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 720-820 |
+| HTTP 请求错误处理 | `bruno-electron/src/ipc/network/index.js` | 1650-1694 | - |
+| HTTP 请求错误处理 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 500-670 |
+| 错误结果追加 | `bruno-electron/src/ipc/network/index.js` | 471-502 | - |
+| Tests 脚本执行 | `bruno-electron/src/ipc/network/index.js` | 1777-1853 | - |
+| Tests 脚本执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 830-890 |
+| Assertions 执行 | `bruno-electron/src/ipc/network/index.js` | 1756-1775 | - |
+| Assertions 执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 821-828 |
 | Runner 配置面板 | `bruno-app/src/components/RunnerResults/RunConfigurationPanel/index.jsx` | 1-450 | - |
 | Runner 结果面板 | `bruno-app/src/components/RunnerResults/index.jsx` | 1-566 | - |
 | CLI 命令定义 | `bruno-cli/src/commands/run.js` | - | 112-307 |
 | Runner 类型定义 | `bruno-common/src/runner/types/index.ts` | 1-125 | 1-125 |
 | 单请求执行 (桌面端) | `bruno-electron/src/ipc/network/index.js` | 737-1158 | - |
-| 单请求执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | - |
-| prepareRequest (桌面端) | `bruno-electron/src/ipc/network/prepare-request.js` | - | - |
-| prepareRequest (CLI) | `bruno-cli/src/runner/prepare-request.js` | - | - |
-| 变量插值 (桌面端) | `bruno-electron/src/ipc/network/interpolate-vars.js` | - | - |
-| 变量插值 (CLI) | `bruno-cli/src/runner/interpolate-vars.js` | - | - |
+| 单请求执行 (CLI) | `bruno-cli/src/runner/run-single-request.js` | - | 1-950 |
+| prepareRequest (桌面端) | `bruno-electron/src/ipc/network/prepare-request.js` | 1-150 | - |
+| prepareRequest (CLI) | `bruno-cli/src/runner/prepare-request.js` | - | 1-100 |
+| 变量插值 (桌面端) | `bruno-electron/src/ipc/network/interpolate-vars.js` | 1-100 | - |
+| 变量插值 (CLI) | `bruno-cli/src/runner/interpolate-vars.js` | - | 1-80 |
+| 标签过滤 (桌面端) | `bruno-electron/src/ipc/network/index.js` | 1343-1350 | - |
+| 标签过滤 (CLI) | `bruno-cli/src/commands/run.js` | - | 637-639 |
+| 选中请求过滤 | `bruno-electron/src/ipc/network/index.js` | 1352-1366 | - |
 
 ---
 
@@ -847,8 +868,8 @@ iterationData?: any; // todo - csv/json row data
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │  🔁 开始请求循环 (WHILE)                                            │
-│     桌面端: bruno-electron/src/ipc/network/index.js:1368-1893 │
-│     CLI: bruno-cli/src/commands/run.js:680-765                    │
+│     桌面端: bruno-electron/src/ipc/network/index.js:1368-1893       │
+│     CLI: bruno-cli/src/commands/run.js:668-753                      │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
