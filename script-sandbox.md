@@ -132,6 +132,102 @@ if (typeof testFile === 'string') {
 
 **执行顺序结论**：**Assertions 先于 Tests 执行**
 
+### 修正 4：Assertions 变量可见性的完整证据链
+
+**原结论**：Assertions 不包含 post-response 中 `bru.setVar()` 设置的变量
+**真实结论**：**Assertions 完全可以读取到 post-response 中通过 `bru.setVar()` 写入的 runtime 变量**
+
+#### 最小证据链
+
+**证据点 1：对象引用传递（关键）**
+```javascript
+// packages/bruno-electron/src/ipc/network/index.js:980-1034
+// 调用 runPostResponse 时，runtimeVariables 以【对象引用】形式传入
+postResponseScriptResult = await runPostResponse(request,
+  response,
+  requestUid,
+  envVars,           // 对象引用
+  collectionPath,
+  collection,
+  collectionUid,
+  runtimeVariables,  // ← 关键：对象引用传递
+  processEnvVars,
+  scriptingConfig,
+  runRequestByItemPathname);
+
+// 后续调用 runAssertions 时，传递【同一个】runtimeVariables 对象引用
+const results = assertRuntime.runAssertions(assertions,
+  request,
+  response,
+  envVars,
+  runtimeVariables,  // ← 同一个对象引用，包含 post-response 中写入的值
+  processEnvVars);
+```
+
+**证据点 2：Bru.setVar() 直接修改引用对象**
+```javascript
+// packages/bruno-js/src/bru.js:283-296
+setVar(key, value) {
+  // ... 参数校验
+  this.runtimeVariables[key] = value;  // ← 直接修改传入的引用对象
+}
+
+// Bru 构造函数直接保存引用，不做拷贝
+constructor({
+  runtimeVariables,  // 外部传入的引用
+  ...
+}) {
+  this.runtimeVariables = runtimeVariables;  // ← 直接赋值引用，不创建副本
+  // ...
+}
+```
+
+**证据点 3：ScriptRuntime 返回修改后的引用**
+```javascript
+// packages/bruno-js/src/runtime/script-runtime.js:90-101
+const buildRequestScriptResult = () => ({
+  request,
+  envVariables: cleanJson(envVariables),         // 只是序列化用于展示
+  runtimeVariables: cleanJson(runtimeVariables), // 只是序列化用于展示
+  // 注意：返回值只是用于结果展示，原始引用已经在脚本执行时被修改
+});
+```
+
+**证据点 4：AssertRuntime 直接展开 runtimeVariables 到上下文**
+```javascript
+// packages/bruno-js/src/runtime/assert-runtime.js:443-453
+const context = {
+  ...globalEnvironmentVariables,
+  ...collectionVariables,
+  ...envVariables,
+  ...folderVariables,
+  ...requestVariables,
+  ...oauth2CredentialVariables,
+  ...runtimeVariables,  // ← 关键：直接展开已被修改的 runtimeVariables 对象
+  ...processEnvVars,
+  ...bruContext
+};
+```
+
+#### 完整变量传递链路
+
+```
+┌─ 主流程调用 runPostResponse(runtimeVariables)
+│  └─ ScriptRuntime.runResponseScript(script, ..., runtimeVariables, ...)
+│     └─ new Bru({ ..., runtimeVariables, ... })  ← 引用传递，不拷贝
+│        └─ 用户脚本执行：bru.setVar('myKey', 'myValue')
+│           └─ this.runtimeVariables['myKey'] = 'myValue'  ← 修改原始引用对象
+│
+└─ 主流程继续调用 runAssertions(..., runtimeVariables, ...)
+   └─ AssertRuntime.runAssertions(..., runtimeVariables, ...)
+      └─ new Bru({ ..., runtimeVariables, ... })  ← 同一个引用，包含 'myKey'
+         └─ context = { ..., ...runtimeVariables }  ← 展开到上下文
+            └─ evaluateJsExpressionBasedOnRuntime(expr, context)
+               └─ 表达式中可以直接使用 myKey 变量
+```
+
+**关键设计结论**：JavaScript 按对象引用传递的特性是变量可见的根本原因。没有任何中间步骤做对象深拷贝，post-response 脚本中对 `runtimeVariables` 的修改是**原地修改**，对后续所有环节（Assertions、Tests）天然可见。
+
 ---
 
 ## 执行链路
@@ -161,11 +257,13 @@ if (typeof testFile === 'string') {
    ├─ ScriptRuntime.runResponseScript()
    ├─ 上下文：Bru + BrunoRequest + BrunoResponse
    ├─ 支持 test() 断言
-   └─ ✘ 出错 → 记录错误但继续后续流程
+   ├─ ✘ 出错 → 记录错误但继续后续流程
+   └─ ✅ bru.setVar() → 原地修改 runtimeVariables 引用
     ↓
 6. Assertions 可视化断言执行【先】
    ├─ AssertRuntime.runAssertions()
    ├─ 上下文：Bru + BrunoRequest + createResponseParser() 返回的 res 对象
+   ├─ ✅ runtimeVariables 已包含 post-response 中设置的变量
    ├─ 遍历所有启用的断言
    └─ 收集 pass/fail 结果
     ↓
@@ -249,16 +347,17 @@ runTests() 抛出异常
 时序：Post-response → Assertions → Tests
 
 变量可见性：
-├─ Post-response 中设置的变量
-│   ├─ ✅ Assertions 可见（先执行 post-response）
+├─ Post-response 中 bru.setVar(key, value) 设置的变量
+│   ├─ ✅ Assertions 可见（对象引用传递，原地修改）
 │   └─ ✅ Tests 可见
 └─ Assertions 中只能使用内置变量，不能设置变量
     └─ Tests 中设置的变量不会反向影响 Assertions（已执行完）
 ```
 
-**注意**：
-- Assertions 使用的是表达式求值，不是完整脚本执行环境，不能设置变量
-- Assertions 上下文包含各级环境变量，但不包含 post-response 脚本中通过 `bru.setVar()` 设置的变量（除非变量插值机制同步）
+**关键澄清**：
+- ✅ **Assertions 完全可以读取** post-response 脚本中通过 `bru.setVar()` 设置的 runtime 变量
+- ❌ 原结论"不包含"是错误的，已通过完整代码证据链修正
+- 机制本质：JavaScript 对象按引用传递 + Bru 类直接修改引用不创建副本
 
 ### 影响 3：断言结果的独立性
 
@@ -289,6 +388,10 @@ res.status === 200
 res('data.items').length > 0
 res.jq('.data.items[0].name') === 'expected'
 res.headers['content-type'].includes('json')
+
+// 同时支持 post-response 中设置的变量
+// 前提：post-response 脚本执行了 bru.setVar('expectedCount', 10)
+res('data.items').length === expectedCount
 ```
 
 ---
