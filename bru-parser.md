@@ -506,16 +506,20 @@ const urlPath: Record<typeof requestType, string> = {
 
 | 请求类型 | 源字段 | 处理逻辑 | 默认值 |
 |----------|--------|----------|--------|
-| http-request | json.http.method | 转大写 | GET |
-| graphql-request | json.http.method | 转大写 | POST |
-| grpc-request | json.grpc.method | 不转大写，保留特殊字符 | 空字符串 |
-| ws-request | 无 | 无 method 字段 | - |
+| http-request | json.http.method | 转大写 | 空字符串 '' |
+| graphql-request | json.http.method | 转大写 | 空字符串 '' |
+| grpc-request | json.grpc.method | 不转大写，保留特殊字符 | 空字符串 '' |
+| ws-request | json.http.method（隐式） | 走 HTTP 分支逻辑，转大写 | 空字符串 '' |
 
 ```javascript
-method: requestType === 'grpc-request'
-  ? _.get(json, 'grpc.method', '')
-  : String(_.get(json, 'http.method') ?? '').toUpperCase()
+// 所有请求类型都无条件设置 method 字段
+method:
+  requestType === 'grpc-request'
+    ? _.get(json, 'grpc.method', '')  // gRPC 从 grpc.method 读，默认 ''
+    : String(_.get(json, 'http.method') ?? '').toUpperCase()  // 其他类型（包括 ws）都走此分支
 ```
+
+> **重要修正**：ws-request **包含** method 字段！由于所有请求类型共享同一 request 对象结构，method 字段在第 47-52 行被无条件设置。纯 WS 请求通常无 http 块，最终 method = 空字符串。
 
 ### 6.4 Headers / Metadata 字段映射
 
