@@ -179,9 +179,9 @@ requestItems = requestItems.filter((item) => {
 
 ### 2.1 断言操作符完整列表
 
-**源码位置**：`packages/bruno-js/src/runtime/assert-runtime.js:202-271`
+**源码位置**：`packages/bruno-js/src/runtime/assert-runtime.js:242-271`（依据 `operators` 数组核对）
 
-断言操作符定义在 `value` 字段前缀，支持以下 30 种操作符：
+断言操作符定义在 `value` 字段前缀，支持以下 28 种操作符：
 
 | 分类 | 操作符 | 说明 | 示例写法 |
 |-----|-------|------|---------|
