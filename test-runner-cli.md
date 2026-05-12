@@ -8,83 +8,9 @@ Bruno CLI 测试运行器是一个用于批量执行 API 集合测试的命令�
 
 ---
 
-## 一、整体架构
+## 一、参数解析与运行计划
 
-### 1.1 核心模块分层
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     CLI 参数解析层                           │
-│  packages/bruno-cli/src/commands/run.js                     │
-│  - yargs 参数定义与示例                                     │
-│  - 环境变量/输出格式配置                                    │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│                     集合加载与运行计划层                    │
-│  packages/bruno-cli/src/utils/collection.js                 │
-│  - createCollectionJsonFromPathname()                       │
-│  - getCallStack() - 构建请求执行栈                          │
-│  - mergeHeaders/mergeVars/mergeScripts/mergeAuth            │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│                     单请求运行器层                           │
-│  packages/bruno-cli/src/runner/run-single-request.js        │
-│  - 预处理脚本执行 → 发送请求 → 后置脚本 → 断言 → 测试      │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│                     脚本/断言运行时层                        │
-│  packages/bruno-js/src/runtime/                             │
-│  - ScriptRuntime (pre-request / post-response)              │
-│  - TestRuntime / AssertRuntime / VarsRuntime                │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│                     报告输出层                               │
-│  packages/bruno-cli/src/reporters/                          │
-│  - html.js  HTML 报告生成                                   │
-│  - junit.js JUnit XML 报告                                  │
-│  - JSON 原生格式                                            │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 1.2 执行流程总览
-
-```
-1. 参数解析 (yargs)
-   ↓
-2. 集合加载 (createCollectionJsonFromPathname)
-   ↓
-3. 环境变量处理 (--env / --env-file / --env-var)
-   ↓
-4. 构建执行栈 (getCallStack)
-   ├─ 按路径/文件夹筛选请求
-   ├─ 递归遍历子目录
-   ├─ 标签过滤 (--tags / --exclude-tags)
-   └─ 测试-only 过滤 (--tests-only)
-   ↓
-5. 循环执行每个请求 (runSingleRequest)
-   ├─ Pre-request 脚本
-   ├─ 变量插值
-   ├─ 发送 HTTP 请求
-   ├─ Post-response 脚本
-   ├─ 断言验证
-   └─ 测试脚本
-   ↓
-6. 汇总执行结果 (getRunnerSummary)
-   ↓
-7. 生成报告 (多格式并行)
-   ↓
-8. 退出码返回
-```
-
----
-
-## 二、参数解析与运行计划
-
-### 2.1 核心命令参数定义
+### 1.1 核心命令参数定义
 
 **文件**：`packages/bruno-cli/src/commands/run.js:112-306`
 
@@ -117,7 +43,7 @@ Bruno CLI 测试运行器是一个用于批量执行 API 集合测试的命令�
 | | `--reporter-skip-headers` | array | 跳过指定头 |
 | | `--reporter-skip-body` | boolean | 跳过请求/响应体 |
 
-### 2.2 环境变量加载优先级机制
+### 1.2 环境变量加载优先级机制
 
 **代码位置**：`packages/bruno-cli/src/commands/run.js:383-525`
 
@@ -147,7 +73,7 @@ Bruno CLI 测试运行器是一个用于批量执行 API 集合测试的命令�
    可通过 {{process.env.VAR_NAME}} 访问
 ```
 
-### 2.3 运行计划构建
+### 1.3 运行计划构建
 
 **核心函数**：`getCallStack(resolvedPaths, collection, { recursive })`
 
@@ -208,7 +134,7 @@ requestItems = requestItems.filter((item) => {
 });
 ```
 
-### 2.4 集合数据结构
+### 1.4 集合数据结构
 
 **集合加载函数**：`createCollectionJsonFromPathname(collectionPath)`
 
@@ -249,9 +175,120 @@ requestItems = requestItems.filter((item) => {
 
 ---
 
-## 三、断言执行与测试运行
+## 二、断言执行机制
 
-### 3.1 单请求执行生命周期
+### 2.1 断言操作符完整列表
+
+**源码位置**：`packages/bruno-js/src/runtime/assert-runtime.js:202-271`
+
+断言操作符定义在 `value` 字段前缀，支持以下 30 种操作符：
+
+| 分类 | 操作符 | 说明 | 示例写法 |
+|-----|-------|------|---------|
+| **等值比较** | `eq` | 等于 | `res.status eq 200` |
+| | `neq` | 不等于 | `res.body.id neq 0` |
+| **数值比较** | `gt` | 大于 | `res.body.total gt 100` |
+| | `gte` | 大于等于 | `res.body.pages gte 5` |
+| | `lt` | 小于 | `res.responseTime lt 1000` |
+| | `lte` | 小于等于 | `res.responseTime lte 500` |
+| | `between` | 区间内 | `res.status between 200, 299` |
+| **包含匹配** | `in` | 在列表中 | `res.body.role in admin,moderator` |
+| | `notIn` | 不在列表中 | `res.body.id notIn 0,-1` |
+| | `contains` | 包含 | `res.body.name contains admin` |
+| | `notContains` | 不包含 | `res.body.email notContains test` |
+| **长度/类型** | `length` | 长度等于 | `res.body.items length 10` |
+| | `isArray` | 是数组 | `res.body.items isArray` |
+| | `isNumber` | 是数字 | `res.body.id isNumber` |
+| | `isString` | 是字符串 | `res.body.name isString` |
+| | `isBoolean` | 是布尔值 | `res.body.active isBoolean` |
+| | `isJson` | 是 JSON 对象/数组 | `res.body isJson` |
+| **正则/字符串** | `matches` | 匹配正则 | `res.body.uuid matches ^[a-f0-9]{32}$` |
+| | `notMatches` | 不匹配正则 | `res.body.email notMatches ^test@` |
+| | `startsWith` | 以...开头 | `res.body.name startsWith user_` |
+| | `endsWith` | 以...结尾 | `res.body.email endsWith @example.com` |
+| **空值判断** | `isEmpty` | 为空 | `res.body.error isEmpty` |
+| | `isNotEmpty` | 不为空 | `res.body.data isNotEmpty` |
+| **存在性判断** | `isNull` | 为 null | `res.body.deletedAt isNull` |
+| | `isUndefined` | 为 undefined | `res.body.extra isUndefined` |
+| | `isDefined` | 已定义 | `res.body.id isDefined` |
+| **布尔判断** | `isTruthy` | 真值 | `res.body.success isTruthy` |
+| | `isFalsy` | 假值 | `res.body.error isFalsy` |
+
+### 2.2 真实执行路径
+
+**运行时类**：`AssertRuntime`（packages/bruno-js/src/runtime/assert-runtime.js）
+
+```javascript
+// 断言执行 5 步法
+runAssertions(assertions, request, response, envVariables, runtimeVariables, processEnvVars) {
+  // 1. 构建执行上下文
+  const bruContext = {
+    bru: new Bru(...),      // Bruno API 对象
+    req: new BrunoRequest(request),  // 请求对象
+    res: createResponseParser(response) // 响应对象（支持 res.status/res.body/res.headers）
+  };
+  const context = {
+    ...globalEnvironmentVariables,
+    ...collectionVariables,
+    ...envVariables,
+    ...folderVariables,
+    ...requestVariables,
+    ...runtimeVariables,
+    ...processEnvVars,
+    ...bruContext
+  };
+
+  // 2. 解析断言操作符（从 value 字段前缀提取）
+  const { operator, value: rhsOperand } = parseAssertionOperator(assertion.value);
+  // 例如 value = "neq 200" → { operator: "neq", rhsOperand: "200" }
+
+  // 3. LHS 求值：JS 表达式执行
+  // lhsExpr = "res.body.items[0].id" → 在 context 中执行 JS 表达式
+  const lhs = evaluateJsExpressionBasedOnRuntime(lhsExpr, context, this.runtime);
+
+  // 4. RHS 求值：根据操作符类型特殊处理
+  const rhs = evaluateRhsOperand(rhsOperand, operator, context, this.runtime);
+  // - in/notIn: 拆分数组 → 每个元素作为模板字符串求值
+  // - between: 拆分成 [min, max] → 分别求值
+  // - matches/notMatches: 正则表达式字符串处理
+  // - 一元操作符: 返回 undefined
+  // - 其他: 作为 JS 模板字符串求值
+
+  // 5. chai.js 断言执行
+  switch (operator) {
+    case 'eq': expect(lhs).to.equal(rhs); break;
+    case 'neq': expect(lhs).to.not.equal(rhs); break;
+    case 'gt': expect(lhs).to.be.greaterThan(rhs); break;
+    case 'gte': expect(lhs).to.be.greaterThanOrEqual(rhs); break;
+    case 'lt': expect(lhs).to.be.lessThan(rhs); break;
+    case 'lte': expect(lhs).to.be.lessThanOrEqual(rhs); break;
+    case 'in': expect(lhs).to.be.oneOf(rhs); break;
+    case 'notIn': expect(lhs).to.not.be.oneOf(rhs); break;
+    case 'contains': expect(lhs).to.include(rhs); break;
+    case 'notContains': expect(lhs).to.not.include(rhs); break;
+    case 'length': expect(lhs).to.have.lengthOf(rhs); break;
+    case 'matches': expect(lhs).to.match(new RegExp(rhs)); break;
+    case 'notMatches': expect(lhs).to.not.match(new RegExp(rhs)); break;
+    case 'startsWith': expect(lhs).to.startWith(rhs); break;
+    case 'endsWith': expect(lhs).to.endWith(rhs); break;
+    case 'between': expect(lhs).to.be.within(rhs[0], rhs[1]); break;
+    case 'isEmpty': expect(lhs).to.be.empty; break;
+    case 'isNotEmpty': expect(lhs).to.not.be.empty; break;
+    case 'isNull': expect(lhs).to.be.null; break;
+    case 'isUndefined': expect(lhs).to.be.undefined; break;
+    case 'isDefined': expect(lhs).to.not.be.undefined; break;
+    case 'isTruthy': expect(lhs).to.be.true; break;
+    case 'isFalsy': expect(lhs).to.be.false; break;
+    case 'isJson': expect(lhs).to.be.json; break;
+    case 'isNumber': expect(lhs).to.be.a('number'); break;
+    case 'isString': expect(lhs).to.be.a('string'); break;
+    case 'isBoolean': expect(lhs).to.be.a('boolean'); break;
+    case 'isArray': expect(lhs).to.be.a('array'); break;
+  }
+}
+```
+
+### 2.3 单请求执行生命周期
 
 **核心函数**：`runSingleRequest()`
 
@@ -299,8 +336,8 @@ requestItems = requestItems.filter((item) => {
 ┌─────────────────────────────────────────────────────────────┐
 │                       阶段 6: 断言执行                       │
 │  AssertRuntime.runAssertions()                              │
-│  - 纯数据驱动，无需脚本                                     │
-│  - 支持: status code / header / body / time 等断言          │
+│  - 基于 chai.js 的 30 种断言操作符                          │
+│  - LHS/RHS 均为 JS 表达式求值                               │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -311,122 +348,7 @@ requestItems = requestItems.filter((item) => {
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 断言执行机制
-
-**断言结构**（`item.request.assertions`）：
-
-```javascript
-[
-  {
-    "enabled": true,
-    "name": "res.status",
-    "value": "200",
-    "assertion": "eq"
-  },
-  {
-    "enabled": true,
-    "name": "res.body.id",
-    "value": "123",
-    "assertion": "ne"
-  }
-]
-```
-
-**断言执行器**：`packages/bruno-js/src/runtime/assert-runtime.js`
-
-```javascript
-class AssertRuntime {
-  runAssertions(
-    assertions,
-    request,
-    response,
-    envVariables,
-    runtimeVariables,
-    processEnvVars
-  ) {
-    return assertions.map((assertion) => {
-      if (!assertion.enabled) return null;
-
-      // 1. 插值左右表达式
-      const lhs = interpolateString(assertion.name, context);
-      const rhs = interpolateString(assertion.value, context);
-
-      // 2. 计算左值（支持 JSONPath）
-      const lhsValue = evaluate(lhs, { req: request, res: response });
-
-      // 3. 根据断言类型执行比较
-      const result = executeAssertion(assertion.assertion, lhsValue, rhs);
-
-      return {
-        status: result ? "pass" : "fail",
-        lhsExpr: assertion.name,
-        lhsValue: lhsValue,
-        rhsExpr: assertion.value,
-        rhsValue: rhs,
-        error: result ? null : `Expected ${rhs}, got ${lhsValue}`
-      };
-    }).filter(Boolean);
-  }
-}
-```
-
-### 3.3 测试脚本执行机制
-
-**测试运行时**：`packages/bruno-js/src/runtime/test-runtime.js`
-
-```javascript
-class TestRuntime {
-  async runTests(
-    testScript,
-    request,
-    response,
-    envVariables,
-    runtimeVariables,
-    collectionPath,
-    onConsoleLog,
-    processEnvVars,
-    scriptingConfig,
-    runRequestCallback,
-    collectionName
-  ) {
-    const results = [];
-
-    // 注入测试 API
-    const test = (description, callback) => {
-      try {
-        callback();
-        results.push({ status: "pass", description });
-      } catch (error) {
-        results.push({
-          status: "fail",
-          description,
-          error: error.message,
-          stack: error.stack
-        });
-      }
-    };
-
-    // 注入 expect API
-    const expect = (actual) => createExpectChain(actual, results);
-
-    // 在沙箱中执行脚本
-    const sandbox = createSandbox({
-      test,
-      expect,
-      req: request,
-      res: response,
-      bru: createBruApi(...),
-      console: createConsoleProxy(onConsoleLog)
-    });
-
-    await sandbox.run(testScript);
-
-    return { results };
-  }
-}
-```
-
-**脚本错误处理策略**：
+### 2.4 脚本错误处理策略
 
 | 阶段 | 错误处理行为 | 结果影响 |
 |------|-------------|----------|
@@ -434,7 +356,7 @@ class TestRuntime {
 | **Post-response** | 记录错误 → 添加 synthetic fail → 继续 | 单请求标记为失败 |
 | **Tests** | 记录错误 → 添加 synthetic fail → 继续 | 单请求标记为失败 |
 
-### 3.4 执行结果数据结构
+### 2.5 执行结果数据结构
 
 ```javascript
 // 单个请求执行结果
@@ -456,7 +378,15 @@ class TestRuntime {
 
   // 四类测试结果
   assertionResults: [          // 数据驱动断言
-    { status: "pass" | "fail", lhsExpr, rhsExpr, error }
+    {
+      uid: "nanoid",
+      lhsExpr: "res.status",   // 左操作数表达式
+      rhsExpr: "eq 200",       // 原始右操作数字符串（含操作符）
+      rhsOperand: "200",       // 提取操作符后的右操作数
+      operator: "eq",          // 断言操作符
+      status: "pass" | "fail",
+      error: null | string     // chai 断言失败消息
+    }
   ],
   preRequestTestResults: [     // pre-request 脚本中的测试
     { status, description, error, stack }
@@ -482,9 +412,9 @@ class TestRuntime {
 
 ---
 
-## 四、报告输出与退出码
+## 三、报告输出与退出码
 
-### 4.1 报告生成流程
+### 3.1 报告生成流程
 
 **代码位置**：`packages/bruno-cli/src/commands/run.js:778-816`
 
@@ -525,7 +455,7 @@ for (const formatter of Object.keys(formats)) {
 }
 ```
 
-### 4.2 JUnit 报告格式
+### 3.2 JUnit 报告格式
 
 **文件**：`packages/bruno-cli/src/reporters/junit.js`
 
@@ -565,7 +495,7 @@ for (const formatter of Object.keys(formats)) {
         + postResponseTestResults.length （后置测试）
 ```
 
-### 4.3 HTML 报告格式
+### 3.3 HTML 报告格式
 
 **文件**：`packages/bruno-cli/src/reporters/html.js` → 调用 `@usebruno/common/runner`
 
@@ -583,7 +513,7 @@ for (const formatter of Object.keys(formats)) {
 }
 ```
 
-### 4.4 汇总统计计算
+### 3.4 汇总统计计算
 
 **函数**：`getRunnerSummary(results)`
 
@@ -640,7 +570,21 @@ if (!anyFailed && status !== 'error') {
 }
 ```
 
-### 4.5 退出码规范
+### 3.5 敏感信息过滤
+
+**代码位置**：`packages/bruno-cli/src/commands/run.js:720-725`
+
+```javascript
+// 报告生成前清理敏感信息
+sanitizeResultsForReporter(results, {
+  skipAllHeaders: reporterSkipAllHeaders,       // 删除所有头
+  skipHeaders: reporterSkipHeaders,             // 删除指定头
+  skipRequestBody: reporterSkipRequestBody || reporterSkipBody,
+  skipResponseBody: reporterSkipResponseBody || reporterSkipBody
+});
+```
+
+### 3.6 退出码规范
 
 **文件**：`packages/bruno-cli/src/constants.js:6-35`
 
@@ -682,71 +626,55 @@ if (
 // 否则正常退出（退出码 0）
 ```
 
-### 4.6 敏感信息过滤
-
-**代码位置**：`packages/bruno-cli/src/commands/run.js:720-725`
-
-```javascript
-// 报告生成前清理敏感信息
-sanitizeResultsForReporter(results, {
-  skipAllHeaders: reporterSkipAllHeaders,       // 删除所有头
-  skipHeaders: reporterSkipHeaders,             // 删除指定头
-  skipRequestBody: reporterSkipRequestBody || reporterSkipBody,
-  skipResponseBody: reporterSkipResponseBody || reporterSkipBody
-});
-```
-
 ---
 
-## 附录：关键调用链
+## 四、入口到退出码串联小结
 
-### 命令入口
+### 4.1 完整执行路径概览
 
 ```
-bru run collection
-  → handler() (run.js)
-    → createCollectionJsonFromPathname()
-    → 环境变量加载
-    → getCallStack() 构建执行计划
-    → forEach requestItem:
-        → runSingleRequest()
-          → prepareRequest()
-          → ScriptRuntime.runRequestScript()
-          → interpolateVars()
-          → axiosInstance(request)
-          → ScriptRuntime.runResponseScript()
-          → AssertRuntime.runAssertions()
-          → TestRuntime.runTests()
-    → getRunnerSummary(results)
-    → 生成报告
-    → process.exit(exitCode)
+CLI 入口 (bin/bru.js)
+    ↓
+yargs 解析参数 (commands/run.js builder)
+    ↓
+handler() 主函数开始
+    ├─ 验证集合根目录 → 非集合目录 → 退出码 4
+    ├─ 加载环境变量 → 环境文件不存在 → 退出码 6
+    ├─ 解析 --env-var 覆盖 → 格式错误 → 退出码 7/8
+    ├─ 构建执行栈 getCallStack()
+    └─ 循环执行每个请求:
+         ├─ runSingleRequest()
+         │   ├─ pre-request 脚本异常 → status: error
+         │   ├─ 网络请求异常 → status: error
+         │   ├─ post-response 脚本异常 → 添加 fail 结果
+         │   ├─ Assertions 断言失败 → 添加 fail 结果
+         │   └─ Tests 脚本异常 → 添加 fail 结果
+         ├─ --bail 模式检测 → 任意失败立即终止循环
+         └─ --delay 延迟控制
+    ↓
+getRunnerSummary(results) 统计汇总
+    ↓
+sanitizeResultsForReporter() 清理敏感数据
+    ↓
+生成报告 (JSON/JUnit/HTML)
+    ├─ 输出目录不存在 → 退出码 2
+    └─ 格式不支持 → 退出码 9
+    ↓
+判定最终退出码
+    ├─ 任意失败/错误存在 → 退出码 1
+    └─ 全部通过 → 退出码 0
+    ↓
+process.exit(exitCode)
 ```
 
-### CI/CD 集成示例
+### 4.2 关键设计决策
 
-```bash
-# 基本用法：运行集合并生成 JUnit 报告
-bru run --env staging --reporter-junit report.xml
+1. **CI友好的退出码策略**：所有失败（请求/断言/测试/脚本）统一返回码 1，便于 CI 流水线直接判定
 
-# 多报告输出：同时生成 JSON、JUnit、HTML
-bru run --reporter-json result.json \
-        --reporter-junit junit.xml \
-        --reporter-html report.html
+2. **渐进式失败处理**：Pre-request 失败立即终止请求但不影响其他请求（除非 --bail）；Post-response/Tests 失败标记后继续执行，最大化测试覆盖率
 
-# 安全模式：隐藏敏感信息
-bru run --reporter-skip-all-headers \
-        --reporter-skip-body
+3. **沙箱一致性**：断言 LHS/RHS 与测试脚本使用相同的 JS 沙箱（quickjs/nodevm），保证求值逻辑一致
 
-# 失败即终止：适合快速反馈流水线
-bru run --bail --env production
+4. **报告可组合性**：支持多格式报告并行输出，满足不同 CI 系统集成需求（JUnit 用于 CI 平台，HTML 用于人工查看，JSON 用于二次处理）
 
-# GitLab CI 配置示例: .gitlab-ci.yml
-# api_test:
-#   script:
-#     - npm install -g @usebruno/cli
-#     - bru run --env ci --reporter-junit junit-report.xml
-#   artifacts:
-#     reports:
-#       junit: junit-report.xml
-#     when: always
-```
+5. **无限循环保护**：`bru.nextRequest()` 跳转计数超过 10000 次触发退出码 3，防止测试脚本死循环导致 CI 挂起
