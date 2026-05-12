@@ -230,38 +230,81 @@ const combinedVars = {
 
 ### 3.2 process.env 命名空间与同名变量覆盖规则
 
-#### 规则 1：系统环境变量最高优先级
-
-如果用户在 Bruno 环境中定义了变量 `FOO=bruno_value`，同时系统环境也有 `FOO=system_value`，则插值时 `{{FOO}}` 会解析为 `system_value`。
-
-**原因**：`processEnvVars` 在对象展开顺序中位于最后，其同名属性会覆盖前面所有层级定义的同名变量。
-
-#### 规则 2：显式访问与隐式合并
+#### 核心架构：process.env 是独立命名空间，不覆盖顶层键
 
 ```javascript
-// 两种访问系统环境变量的方式
-1. {{FOO}}                 → 隐式：走完整合并链，process.env.FOO 可能覆盖其他层级
-2. {{process.env.FOO}}     → 显式：直接访问系统环境，不经过变量合并链
+// 真实合并逻辑
+const combinedVars = {
+  ...globalEnvironmentVariables,    // 顶层：所有 Bruno 内部变量合并
+  ...collectionVariables,
+  ...envVariables,
+  ...folderVariables,
+  ...requestVariables,
+  ...oauth2CredentialVariables,
+  ...runtimeVariables,
+  ...promptVariables,
+  process: {                        // 独立嵌套命名空间
+    env: {
+      ...processEnvVars             // 系统环境变量仅在此命名空间内
+    }
+  }
+};
 ```
 
-**重要区别**：
-- 隐式方式 `{{FOO}}` 可能被脚本运行时变量（如 `bru.setVar('FOO', 'runtime')`）再次覆盖
-- 显式方式 `{{process.env.FOO}}` 始终读取系统环境原始值
+**关键结论**：`processEnvVars` 不会直接展开到顶层，因此 `process.env.DB_HOST` 不会覆盖顶层 `DB_HOST`。
 
-#### 规则 3：同名变量层级覆盖示例
+---
+
+#### 两种语法的解析路径对比
+
+| 插值语法 | 解析路径 | 读取来源 |
+|---------|---------|---------|
+| `{{DB_HOST}}` | 直接读取顶层 `combinedVars.DB_HOST` | Bruno 内部 9 层变量合并结果 |
+| `{{process.env.DB_HOST}}` | 读取嵌套属性 `combinedVars.process.env.DB_HOST` | 系统环境变量原始值 |
+
+---
+
+#### 可复现并存示例：多层级同名变量共存场景
+
+假设以下 7 个层级同时定义了同名变量 `DB_HOST`：
 
 ```javascript
-// 假设各层级都定义了同名变量 DB_HOST：
+// 1. 全局环境定义
 globalEnvironmentVariables.DB_HOST = 'global-host'
+
+// 2. 集合级定义
 collectionVariables.DB_HOST      = 'collection-host'   // 覆盖全局
+
+// 3. 当前环境定义
 envVariables.DB_HOST             = 'env-host'          // 覆盖集合
+
+// 4. 文件夹级定义
 folderVariables.DB_HOST          = 'folder-host'       // 覆盖环境
+
+// 5. 请求级定义
 requestVariables.DB_HOST         = 'request-host'      // 覆盖文件夹
-runtimeVariables.DB_HOST         = 'runtime-host'      // 覆盖请求
-processEnvVars.DB_HOST           = 'system-host'       // 最终生效值
+
+// 6. 运行时脚本定义
+bru.setVar('DB_HOST', 'runtime-host')  // runtimeVariables.DB_HOST
+
+// 7. 系统环境变量定义
+process.env.DB_HOST               = 'system-host'       // 仅在命名空间内
 ```
 
-**最终结果**：`{{DB_HOST}}` = `system-host`
+**实际解析结果**：
+
+| 插值写法 | 解析值 | 说明 |
+|---------|-------|------|
+| `{{DB_HOST}}` | `runtime-host` | 取顶层合并最终值（来自 `runtimeVariables`） |
+| `{{process.env.DB_HOST}}` | `system-host` | 直接读取系统环境，不受 Bruno 内部变量影响 |
+
+---
+
+#### 重要澄清：process.env 的边界
+
+1. **命名空间隔离**：系统环境变量与 Bruno 内部变量是平行命名空间，互不覆盖
+2. **预插值例外**：环境变量本身的 value 支持 `{{process.env.VAR}}` 语法，此时会在预插值阶段解析
+3. **脚本内访问**：在脚本中 `bru.getEnvVar('DB_HOST')` 与 `{{DB_HOST}}` 行为一致，仅读 Bruno 内部变量
 
 ### 3.3 变量插值流程
 
