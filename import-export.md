@@ -613,46 +613,105 @@ OpenAPI → Bruno → [OpenCollection 中间格式] → [自定义转换] → Op
 
 ---
 
-## 10. 三种来源字段丢失对照与处理策略
+## 10. Postman 导入字段丢失详表
 
-| 功能域 | Postman 导入 | OpenAPI 导入 | Insomnia 导入 | 通用处理策略 |
-|-------|-------------|-------------|--------------|------------|
-| **认证 (Auth)** | | | | |
-| Basic | ✅ 完整支持 | ✅ 支持（变量占位符） | ✅ 完整支持 | - |
-| Bearer | ✅ 完整支持 | ✅ 支持（变量占位符） | ✅ 完整支持 | - |
-| Digest | ✅ 完整支持 | ✅ 支持（变量占位符） | ❌ **不支持，降级 none** | 导入后手动配置 |
-| NTLM | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
-| AWS SigV4 | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
-| API Key | ✅ 支持（仅 header） | ✅ 支持（header/query） | ❌ **不支持，降级 none** | 导入后手动配置 |
-| WSSE | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
-| OAuth 1.0 | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
-| OAuth 2.0 | ✅ 4 种授权流完整 | ✅ 支持（变量占位符） | ❌ **不支持，降级 none** | 导入后手动配置 |
-| **脚本 (Scripts)** | | | | |
-| Pre-request | ✅ 代码文本导入 | ❌ OpenAPI 无脚本概念 | ❌ **不支持** | - |
-| Post-response / Tests | ✅ 代码文本导入 | ❌ OpenAPI 无脚本概念 | ❌ **不支持** | - |
-| 脚本 API 语义 | ⚠️ 文本保留，不转换 `pm.*` → `bru.*` | - | - | 运行时可能出错，需手动修改 |
-| **环境变量** | | | | |
-| 普通变量 | ✅ 完整支持 + secret 标记 | ❌ OpenAPI 无环境概念 | ✅ 扁平化导入 | - |
-| 嵌套结构变量 | ✅ 原样保留 key | ❌ - | ⚠️ **强制扁平化，点号分隔** | 嵌套结构丢失层级 |
-| 初始值 | ✅ 导入（secret 标记清空） | ❌ - | ✅ 导入 | - |
-| **请求体 (Body)** | | | | |
-| JSON/XML/Text | ✅ 完整支持 | ⚠️ 从 Schema 生成示例值 | ✅ 完整支持 | OpenAPI 示例值可能不真实 |
-| form-urlencoded | ✅ 完整支持 | ✅ 支持 | ✅ 完整支持 | - |
-| multipart/form-data | ✅ 完整支持（文本） | ✅ 支持 | ⚠️ **仅文本，不支持文件** | 文件需重新选择 |
-| GraphQL | ✅ 完整支持 | ✅ 支持 | ✅ 完整支持 | - |
-| 二进制/文件 | ✅ 文件路径保留 | ❌ - | ❌ **不支持，丢弃** | 导入后手动添加 |
-| **其他特性** | | | | |
-| 示例响应 (Examples) | ✅ 完整导入 | ✅ 从 response examples 生成 | ❌ **不支持** | - |
-| 文件夹排序 | ✅ seq 序号 Hydrate | ✅ 按 tags/path 分组 | ✅ 按原结构 | - |
-| 变量语法 | ✅ `{{var}}` 保留 | ✅ `{{var}}` 占位符 | ⚠️ 空格/前缀清理：`{{ _.a b}}` → `{{ab}}` | 可能导致变量名变化 |
-| 重复名称处理 | ✅ 自动添加 `_1, _2...` 后缀 | ✅ 自动添加后缀 | ✅ 自动添加后缀 | - |
-| Cookie | ❌ **不支持** | ❌ OpenAPI cookie 参数 → header | ❌ **不支持** | Cookie 需手动管理 |
-| 代理配置 | ❌ **不支持** | ❌ - | ❌ - | 独立配置，不随集合导入 |
-| 证书配置 | ❌ **不支持** | ❌ - | ❌ - | 独立配置，不随集合导入 |
+| 字段/功能 | 是否丢失 | 触发条件 | Bruno 当前处理 | 补救动作 | 最小示例 |
+|----------|---------|---------|--------------|---------|---------|
+| **认证类** | | | | | |
+| Basic Auth | ❌ 不丢失 | - | username/password 原样导入 | - | `auth.basic.username = "admin"` → Bruno 保留 |
+| Bearer Token | ❌ 不丢失 | - | token 原样导入 | - | `auth.bearer.token = "jwt_xxx"` → Bruno 保留 |
+| Digest Auth | ❌ 不丢失 | - | username/password 原样导入 | - | Postman Digest → Bruno Digest 完整映射 |
+| NTLM Auth | ❌ 不丢失 | - | username/password/domain 原样导入 | - | 完整支持所有字段 |
+| AWS SigV4 | ❌ 不丢失 | - | accessKey/secretKey/service/region 原样导入 | - | 8 个字段完整映射 |
+| API Key | ⚠️ 部分丢失 | placement = query | 仅支持 header 放置，query 丢 | 导入后改 placement | Postman `in: query` → Bruno 变 `in: header` |
+| WSSE Auth | ❌ 不丢失 | - | username/password 原样导入 | - | 完整支持 |
+| OAuth 1.0 | ❌ 不丢失 | - | 9 个字段完整映射 | - | consumerKey/token/signatureMethod 全保留 |
+| OAuth 2.0 | ❌ 不丢失 | - | 4 种授权流完整映射 | - | client_credentials/authorization_code 等均支持 |
+| **脚本类** | | | | | |
+| Pre-request 脚本 | ⚠️ 文本丢失语义 | 含 `pm.*` API 调用 | 代码文本原样导入，不做 API 转换 | 手动改 `pm.*` → `bru.*` | `pm.globals.get("token")` → 导入后需改 `bru.globals.get("token")` |
+| Test 脚本 | ⚠️ 文本丢失语义 | 含 `pm.test(...)` | 代码文本原样导入 | 手动改写测试逻辑 | `pm.response.to.have.status(200)` → 语法不兼容 |
+| **环境变量** | | | | | |
+| 普通变量 | ❌ 不丢失 | - | key/value/enabled 完整导入 | - | Postman Environment JSON → Bruno 1:1 映射 |
+| Secret 变量 | ⚠️ 值丢失 | variable.type = secret | 保留 secret 标记，value 置空 | 导入后手动填值 | `{ key: "password", value: "123", type: "secret" }` → value 变空字符串 |
+| Collection 变量 | ⚠️ 扫描推断 | 引用了 `{{var}}` 但未在 Environment 定义 | 正则扫描全集合提取 key，value 留空 | 导入后补充变量值 | URL 含 `{{baseUrl}}` → 推断出 collection 变量 baseUrl |
+| **请求体** | | | | | |
+| JSON/XML/Text | ❌ 不丢失 | - | 内容原样导入 | - | 完整保留 |
+| form-urlencoded | ❌ 不丢失 | - | key/value/enabled 完整导入 | - | 所有字段保留 |
+| multipart/form-data | ⚠️ 部分丢失 | param.type = file | 文件路径保留，但文件内容不导入 | 导入后重新选文件 | `{ key: "avatar", type: "file", src: "/tmp/a.jpg" }` → src 路径保留 |
+| 二进制 body | ⚠️ 丢失 | body.mode = file | 文件路径保留 | 导入后重新选文件 | 路径保留，需重选 |
+| **其他特性** | | | | | |
+| 示例响应 Examples | ❌ 不丢失 | - | name/status/headers/body 完整导入 | - | Postman response examples → Bruno examples 完整映射 |
+| Cookie | ❌ 完全丢失 | 任何 Cookie 配置 | 不解析 Cookie 字段 | 手动复制 Cookie 值到 Header | Postman cookie jar → 不导入 |
+| 代理配置 | ❌ 完全丢失 | 任何代理设置 | 不导入代理配置 | Bruno 设置里手动配 | Postman proxy → 丢弃 |
+| 客户端证书 | ❌ 完全丢失 | 任何证书配置 | 不导入证书 | Bruno 设置里手动配 | Postman client cert → 丢弃 |
 
 ---
 
-## 11. 导入导出最佳实践
+## 11. OpenAPI 导入字段丢失详表
+
+| 字段/功能 | 是否丢失 | 触发条件 | Bruno 当前处理 | 补救动作 | 最小示例 |
+|----------|---------|---------|--------------|---------|---------|
+| **认证类** | | | | | |
+| Basic Auth | ⚠️ 丢失值 | securitySchemes.type = http, scheme = basic | 生成 `{{username}}` / `{{password}}` 占位符 | 导入后在环境变量填真实值 | OpenAPI securitySchemes → Bruno auth.basic 仅占位，无真实值 |
+| Bearer Token | ⚠️ 丢失值 | securitySchemes.type = http, scheme = bearer | 生成 `{{token}}` 占位符 | 导入后填真实 token | `token: "{{token}}"` → 无真实值 |
+| API Key | ⚠️ 丢失值 | securitySchemes.type = apiKey | 在 Header/Query 添加占位符 `{{apiKey}}` | 导入后填真实值 | `X-API-Key: "{{apiKey}}"` → 无真实值 |
+| OAuth 2.0 | ⚠️ 部分丢失 | securitySchemes.type = oauth2 | 仅识别 grantType，其他 OAuth 配置丢 | 手动补全 OAuth 配置 | OpenAPI flows.authorizationCode → Bruno 仅 grantType，其他字段空 |
+| Digest/NTLM/WSSE/OAuth1 | ❌ 完全丢失 | 任何非标准 http 认证 | 无对应 OpenAPI scheme，直接丢弃 | 导入后手动配 | OpenAPI 无 Digest scheme → Bruno auth.mode = inherit |
+| **脚本类** | | | | | |
+| Pre-request 脚本 | ❌ 完全丢失 | - | OpenAPI 无脚本概念 | 手动写脚本 | - |
+| Test 脚本 | ❌ 完全丢失 | - | OpenAPI 无测试概念 | 手动写测试 | - |
+| **环境变量** | | | | | |
+| 服务器变量 | ⚠️ 丢失值 | servers[].variables | 变量名识别，值留空 | 导入后填 server 变量值 | `servers: [{ url: "{env}.api.com", variables: { env: { default: "prod" } } }]` → 只识别变量名 |
+| 普通环境变量 | ❌ 完全丢失 | - | OpenAPI 无环境概念 | 手动创建环境 | - |
+| **请求体** | | | | | |
+| JSON Body | ⚠️ 丢失真实值 | requestBody.content["application/json"] | 从 schema.example 或 properties 生成示例值 | 替换为真实请求数据 | Schema `type: object, properties: { id: { type: number } }` → 生成 `{ "id": 0 }` 示例 |
+| form-urlencoded | ⚠️ 丢失真实值 | requestBody.content["application/x-www-form-urlencoded"] | 从 schema 生成示例值 | 替换为真实数据 | 每个字段用 type 默认值（string→"", number→0） |
+| multipart/form-data | ⚠️ 丢失真实值 | requestBody.content["multipart/form-data"] | 从 schema 生成示例值，不生成文件 | 手动添加文件字段 | 文件字段只生成 key，无文件路径 |
+| 二进制 body | ❌ 完全丢失 | requestBody.content["application/octet-stream"] | 不处理二进制 | 手动改 body mode = file | - |
+| **其他特性** | | | | | |
+| 示例响应 Examples | ⚠️ 部分丢失 | responses[].content[].examples | 导入 name + body，headers/status 可能丢失 | 手动补全响应状态码和头 | OpenAPI response examples → Bruno examples 仅保留 body |
+| Path 参数 | ⚠️ 丢失值 | parameters[].in = path | 参数名保留，值留空 | 导入后填参数值 | `/users/{id}` → params.name = "id", value = "" |
+| Query 参数 | ⚠️ 丢失值 | parameters[].in = query | 参数名保留，从 schema 默认值/枚举生成示例 | 替换为真实值 | schema.default = 1 → value = "1" |
+| Header 参数 | ⚠️ 丢失值 | parameters[].in = header | 参数名保留，从 schema 生成示例 | 替换为真实值 | - |
+| Cookie 参数 | ⚠️ 转 Header 丢语义 | parameters[].in = cookie | 转成 Header 字段，Cookie 语义丢失 | 理解为普通 Header | Cookie: session=xxx → 变成 Header 名为 Cookie |
+| 枚举参数 | ⚠️ 结构丢失 | schema.enum 存在 | 仅导入第一个 enum 值为默认，其他 enum 丢 | Bruno 不支持参数多选 | `enum: ["a", "b", "c"]` → 仅 "a" 为值，b/c 丢失 |
+| 服务器分组 | ❌ 完全丢失 | servers 数组有多个 | 仅用第一个 server URL，其他丢 | 手动创建环境区分多服务器 | `servers: [{url: "prod.com"}, {url: "dev.com"}]` → 只用 prod.com |
+
+---
+
+## 12. Insomnia 导入字段丢失详表
+
+| 字段/功能 | 是否丢失 | 触发条件 | Bruno 当前处理 | 补救动作 | 最小示例 |
+|----------|---------|---------|--------------|---------|---------|
+| **认证类** | | | | | |
+| Basic Auth | ❌ 不丢失 | authentication.type = basic | username/password 原样导入 | - | 完整支持 |
+| Bearer Token | ❌ 不丢失 | authentication.type = bearer | token 原样导入 | - | 完整支持 |
+| Digest/NTLM/AWS/ApiKey/WSSE/OAuth1/OAuth2 | ❌ 完全丢失 | 任何非 basic/bearer 认证 | 静默降级为 auth.mode = none | 导入后手动重新配置认证 | authentication.type = oauth2 → Bruno auth.mode = none，所有 OAuth 字段全丢 |
+| **脚本类** | | | | | |
+| Pre-request 脚本 | ❌ 完全丢失 | - | Insomnia 插件/钩子不导入 | 手动写脚本 | Insomnia Request Hooks → 不导入 |
+| Test 脚本 | ❌ 完全丢失 | - | Insomnia 测试不导入 | 手动写测试 | - |
+| **环境变量** | | | | | |
+| 普通变量 | ⚠️ 结构丢失 | 环境变量值是嵌套对象 | 强制扁平化，点号分隔 key | 检查变量引用是否需改名称 | Insomnia: `{ db: { host: "localhost" } }` → Bruno: `name = "db.host", value = "localhost"` |
+| 子环境继承 | ⚠️ 结构丢失 | baseEnv + subEnvironments | Shallow merge base + sub，生成独立 Environment | 理解继承关系已固化为独立环境 | Base: { a: 1 }, Sub: { b: 2 } → Bruno Sub env: { a: 1, b: 2 } |
+| Secret 标记 | ❌ 完全丢失 | - | Insomnia Secret 不识别，全部当普通变量 | 手动标记 secret 变量 | - |
+| **请求体** | | | | | |
+| JSON/XML/Text | ❌ 不丢失 | - | 内容原样导入 | - | 完整保留 |
+| form-urlencoded | ❌ 不丢失 | - | key/value/enabled 完整导入 | - | 所有字段保留 |
+| multipart/form-data | ⚠️ 严重丢失 | params[].type = file | 强制转 `type: 'text'`，文件名/路径全丢 | 导入后重新选文件 | Insomnia file param → Bruno type 变 text，value 为空字符串 |
+| GraphQL | ❌ 不丢失 | body.mimeType = application/graphql | JSON 解析 query/variables | - | 完整支持 |
+| 二进制 body | ❌ 完全丢失 | 其他 MIME type | body.mode 设为 none，内容全丢 | 导入后手动选文件 | 二进制/图片/压缩包 → 全部丢弃 |
+| **其他特性** | | | | | |
+| 示例响应 Examples | ❌ 完全丢失 | - | Insomnia Response 不导入 | 手动添加示例 | Insomnia 保存的响应 → 不导入 |
+| 变量名规范化 | ⚠️ 名称变化 | 变量名含空格或 `_.` 前缀 | 去空格 + 去 `_.` 前缀 | 检查所有 `{{var}}` 引用一致性 | `{{ _.api token}}` → `{{apitoken}}` |
+| 请求/文件夹名称 | ⚠️ 名称变化 | 同级别有重名 | 自动加 `_1, _2...` 后缀 | 检查文件夹/请求名称变化 | 两个 "Get User" → 变 "Get User" + "Get User_1" |
+| Cookie | ❌ 完全丢失 | - | Insomnia Cookie Jar 不导入 | 手动复制 Cookie 值 | - |
+| 代理配置 | ❌ 完全丢失 | - | 不导入 | 手动配置 | - |
+| 客户端证书 | ❌ 完全丢失 | - | 不导入 | 手动配置 | - |
+| 环境颜色 | ❌ 完全丢失 | - | Insomnia Environment color 字段不导入 | 手动改环境颜色 | - |
+
+---
+
+## 13. 导入导出最佳实践
 
 ### 11.1 Postman 往返导入
 1. **导出前备份**：复杂集合建议先备份原始 Postman JSON
