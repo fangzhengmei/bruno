@@ -243,7 +243,11 @@ switch (grantType) {
 }
 ```
 
-**重要修正**：不存在统一的 `getOAuth2Token()` 入口函数。四种 Grant Type 从 `configureRequest()` 直接并行分流，各自走独立实现。
+**Electron 桌面端特点**：四种 Grant Type 从 `configureRequest()` 直接并行分流，各自调用独立实现函数，**无统一入口函数**。
+
+> ⚠️ 注意：以上为 Electron 桌面端实现。**CLI 命令行端有统一的 `getOAuth2Token()` 入口函数**（位于 `@usebruno/requests` 包），但仅支持 `client_credentials` 和 `password` 两种纯后端 Grant Type，详见 2.2 节双平台对比。
+
+---
 
 #### 2.4.2 浏览器授权窗口实现（证据）
 
