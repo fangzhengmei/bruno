@@ -622,12 +622,34 @@ axiosRequest.headers['X-WSSE'] =
 
 ## 五、修正说明
 
-本报告 v2 版本相对于初版的关键修正：
+### v3 版本（当前）关键修正
 
-1. **✓ 删除了不存在的 `getOAuth2Token()` 统一入口描述**
-2. **✓ 补充了四种 Grant Type 的准确分流关系与调用入口函数**
-3. **✓ 新增授权模式分层架构图（Layer 1/2/3）**
+针对前版的两处关键错误进行了精准修正：
+
+1. **✓ 修正了 OAuth2 分流图中 password 的归类错误**
+   - 错误：v2 版分流图将 password 与 authorization_code 并列归入浏览器授权链路
+   - 修正：password 归入 🟢 Layer 3 纯后端 API 模式，与 client_credentials 并列
+   - 证据：`packages/bruno-electron/src/utils/oauth2.js` 中 `getOAuth2TokenUsingPasswordCredentials()` 无任何浏览器相关代码
+
+2. **✓ 修正了 "没有统一 getOAuth2Token 入口" 的不准确表述**
+   - 错误：v2 版笼统宣称"不存在统一的 getOAuth2Token() 入口函数"
+   - 修正：区分双平台架构表述
+     - ✅ Electron 桌面端：**没有**统一入口，四种 Grant Type 在 `configureRequest()` 中并行分流，各自调用独立实现函数
+     - ✅ CLI 命令行端：**有**统一的 `getOAuth2Token()` 入口（位于 `@usebruno/requests` 包），但仅支持 2 种纯后端 Grant Type
+   - CLI 入口证据：
+     - `packages/bruno-cli/src/utils/oauth2.js:24-28` - CLI 侧封装
+     - `packages/bruno-requests/src/auth/oauth2-helper.ts:19` - TypeScript 类型约束（仅 `client_credentials | password`）
+     - `packages/bruno-requests/src/auth/oauth2-helper.ts:319-343` - 实际统一入口实现
+
+3. **✓ 新增双平台差异化架构图**，清晰展示 Electron vs CLI 的能力边界
 4. **✓ 补充了各关键节点的源码证据与行号引用**
-5. **✓ 补充了 implicit flow 不支持 refresh token 的说明**
-6. **✓ 新增 Session 隔离机制的说明**
-7. **✓ 补充了 WSSE 动态生成 nonce 的跨请求复用说明**
+
+---
+
+### 版本演进脉络
+
+| 版本 | 关键变更 | 主要问题 |
+|------|---------|---------|
+| v1 | 初版 | 分流图错误、统一入口表述完全错误 |
+| v2 | 新增分层架构、修正部分错误 | 仍有两处关键错误：password 归类、统一入口表述 |
+| v3 | 当前版 | ✅ 全部修正完毕，双平台架构清晰，证据完整 |
