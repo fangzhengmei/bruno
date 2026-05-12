@@ -313,7 +313,7 @@ gRPC 支持四种调用模式，根据请求/响应是否流式区分：
 | **Metadata 传递位置** | 第 5 个参数 (message 后) | 第 5 个参数 (message 后) | 第 4 个参数 (无 message) | 第 4 个参数 (无 message) |
 | **响应回调参数** | 第 6 个参数 (有 callback) | 第 6 个参数 (有 callback) | 第 5 个参数 (有 callback) | 无 callback 参数 |
 | **响应消费方式** | callback 单次回调 | `data` 事件流式多次触发 | callback 单次回调 (end 后触发) | `data` 事件流式多次触发 |
-| **结束事件** | `status` 事件 | `end` + `status` | `status` 事件 | `end` + `status` |
+| **结束事件** | 完成事件组竞争触发 | 完成事件组竞争触发 | 完成事件组竞争触发 | 完成事件组竞争触发 |
 | **是否需要 `rpc.end()`** | 否 | 否 | 是 (标记发送结束) | 是 (标记发送结束) |
 | **requestStream** | `false` | `false` | `true` | `true` |
 | **responseStream** | `false` | `true` | `false` | `true` |
@@ -432,7 +432,7 @@ gRPC 支持四种调用模式，根据请求/响应是否流式区分：
 - **Payload 序列化触发点**：每次调用 `rpc.write()` 时自动序列化
 - **Metadata 传递位置**：第 4 个参数（无 message，无 callback）
 - **响应消费**：全部通过 `data` 事件流式接收，无 callback 参数
-- **结束事件**：必须调用 `rpc.end()` 标记发送完成；服务端流结束时先触发 `end` 事件，再触发 `status` 事件
+- **结束事件**：必须调用 `rpc.end()` 标记客户端发送完成；服务端结束时 `end` 事件与 `status` 事件竞争触发完成，代码不作顺序保证
 
 ---
 
