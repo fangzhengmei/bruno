@@ -49,11 +49,12 @@ Bruno 的 WebSocket/GraphQL Subscription 系统采用三层架构设计：
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**关键文件位置：**
+**关键文件位置**：
 - `packages/bruno-requests/src/ws/ws-client.js` - 核心 WebSocket 客户端
 - `packages/bruno-electron/src/ipc/network/ws-event-handlers.js` - IPC 事件处理器
 - `packages/bruno-app/src/utils/network/ws-event-listeners.js` - React 事件监听 Hook
 - `packages/bruno-app/src/components/RequestPane/WsQueryUrl/index.js` - 连接控制 UI
+- `packages/bruno-app/src/providers/ReduxStore/slices/collections/index.js` - Redux 状态管理
 
 ---
 
@@ -120,12 +121,12 @@ async startConnection({ request, collection, options = {} }) {
 
 ### 2. 协议协商机制
 
-**支持的 WebSocket 子协议：**
+**支持的 WebSocket 子协议**：
 - `graphql-transport-ws` (graphql-ws 协议)
 - `graphql-ws` (旧版 subscriptions-transport-ws 协议)
 - 自定义协议通过 `Sec-WebSocket-Protocol` Header 指定
 
-**协议协商流程：**
+**协议协商流程**：
 1. 用户在 Request Headers 中配置 `Sec-WebSocket-Protocol: graphql-transport-ws`
 2. `prepareWsRequest` 提取并规范化协议头（第 61-70 行）
 3. `WsClient.startConnection` 将协议数组传递给 WebSocket 构造函数
@@ -148,7 +149,7 @@ ws.on('upgrade', (response) => {
 
 虽然 Bruno 没有内置 graphql-ws 协议的自动化处理，但支持用户手动发送协议消息：
 
-**典型 GraphQL Subscription 协议交互：**
+**典型 GraphQL Subscription 协议交互**：
 ```
 Client → Server: {"type":"connection_init","payload":{"token":"..."}}
 Server → Client: {"type":"connection_ack"}
@@ -163,7 +164,7 @@ Server → Client: {"id":"1","type":"complete"}
 
 ### 1. 消息队列设计
 
-**队列目的：** 解决连接建立前的消息发送时序问题，确保消息在连接 open 后按顺序发送。
+**队列目的**：解决连接建立前的消息发送时序问题，确保消息在连接 open 后按顺序发送。
 
 ```javascript
 // 文件: packages/bruno-requests/src/ws/ws-client.js:167-190
@@ -193,7 +194,7 @@ queueMessage(requestId, collectionUid, message, format = 'raw') {
 }
 ```
 
-**队列刷新触发点：**
+**队列刷新触发点**：
 - WebSocket `open` 事件触发时（第 304-306 行）
 - 调用 `queueMessage` 时若连接已建立
 
@@ -231,9 +232,27 @@ sendMessage(requestId, collectionUid, message, format = 'raw') {
 }
 ```
 
-### 3. 消息接收与分发
+### 3. 消息接收与响应面板追加完整路径
 
-**接收事件处理器：**
+**完整事件链路**（从服务端到 UI 渲染）：
+
+```
+Step 1: WebSocket 接收数据
+        ↓ (ws.on('message'))
+Step 2: WsClient 触发 eventCallback('main:ws:message', ...)
+        ↓ (sendEvent)
+Step 3: Main 进程通过 webContents.send 发送到 Renderer
+        ↓ (ipcRenderer.on)
+Step 4: useWsEventListeners Hook 监听到事件
+        ↓ (dispatch)
+Step 5: wsResponseReceived reducer 处理
+        ↓ (concat to responses)
+Step 6: item.response.responses 数组追加消息
+        ↓ (selector / re-render)
+Step 7: ResponsePane 组件订阅状态变化，实时渲染
+```
+
+**Step 1-2: 接收与事件触发**
 ```javascript
 // 文件: packages/bruno-requests/src/ws/ws-client.js:344-364
 ws.on('message', (data) => {
@@ -260,7 +279,17 @@ ws.on('message', (data) => {
 });
 ```
 
-**IPC 事件分发到 UI：**
+**Step 3: IPC 跨进程传递**
+```javascript
+// 文件: packages/bruno-electron/src/ipc/network/ws-event-handlers.js:291-298
+const sendEvent = (eventName, ...args) => {
+  if (window && !window.isDestroyed() && window.webContents && !window.webContents.isDestroyed()) {
+    window.webContents.send(eventName, ...args);
+  }
+};
+```
+
+**Step 4: Renderer 监听与 Dispatch**
 ```javascript
 // 文件: packages/bruno-app/src/utils/network/ws-event-listeners.js:45-53
 const removeWsMessageListener = ipcRenderer.on('main:ws:message', 
@@ -275,29 +304,76 @@ const removeWsMessageListener = ipcRenderer.on('main:ws:message',
 );
 ```
 
-**Redux Store 更新：**
-- 事件通过 `wsResponseReceived` action 分发
-- Response Panel 订阅 store 变化，实时追加消息
-- 消息序列号 `seq` 确保 UI 显示顺序正确
+**Step 5-6: Redux Reducer 追加消息**
+```javascript
+// 文件: packages/bruno-app/src/providers/ReduxStore/slices/collections/index.js:3437-3462
+wsResponseReceived: (state, action) => {
+  const { itemUid, collectionUid, eventType, eventData } = action.payload;
+  const collection = findCollectionByUid(state.collections, collectionUid);
+  const item = findItemInCollection(collection, itemUid);
+  
+  const currentResponse = item.response || initiatedWsResponse;
+  
+  switch (eventType) {
+    case 'message':
+      // 关键: 使用 concat 追加新消息到 responses 数组，保留历史消息
+      updatedResponse.responses = (currentResponse?.responses || []).concat(eventData);
+      break;
+    // ... 其他事件处理
+  }
+  
+  item.response = updatedResponse;
+}
+```
+
+**Step 7: UI 渲染**
+- ResponsePane 组件通过 `useSelector` 订阅 `item.response.responses`
+- 数组更新触发组件重渲染
+- 按 `seq` 序号排序后显示所有消息（包括历史消息和新消息）
 
 ---
 
 ## 断线重连策略
 
-### 1. URL 变更自动重连
+### 1. 网络断开后的行为
 
-**检测机制：**
+**重要澄清**：Bruno 当前实现中**网络断开后不会自动重连**。
+
+**断开检测机制**：
+- 网络断开时，WebSocket 触发 `close` 事件
+- 触发 `main:ws:close` 事件，UI 更新状态为 `CLOSED`
+- 从 `activeConnections` Map 中移除连接
+- **清空该连接的消息队列**（#removeConnection 第 415-418 行）
+
+```javascript
+// 文件: packages/bruno-requests/src/ws/ws-client.js:366-375
+ws.on('close', (code, reason) => {
+  this.eventCallback('main:ws:close', requestId, collectionUid, {
+    code,
+    reason: Buffer.from(reason).toString(),
+    seq: seq.next(requestId, collectionUid),
+    timestamp: Date.now()
+  });
+  seq.clean(requestId, collectionUid);
+  this.#removeConnection(requestId);  // 这里会清空消息队列
+});
+```
+
+### 2. 仅 URL 变化触发的重连
+
+**唯一自动重连触发点**：URL（包括变量插值后的 URL）发生变化。
+
 ```javascript
 // 文件: packages/bruno-app/src/components/RequestPane/WsQueryUrl/index.js:117-122
 useEffect(() => {
-  if (connectionStatus !== 'connected') return;
+  if (connectionStatus !== 'connected') return;  // 未连接时不触发
   if (previousDeboundedInterpolatedURL.current === debouncedInterpolatedURL) return;
   if (debouncedInterpolatedURL === '') return;
-  handleReconnect();
+  handleReconnect();  // 仅当 URL 变化时才重连
 }, [debouncedInterpolatedURL, connectionStatus]);
 ```
 
-**重连实现：**
+**重连实现**：
 ```javascript
 // 文件: packages/bruno-app/src/components/RequestPane/WsQueryUrl/index.js:81-91
 const handleReconnect = async (e) => {
@@ -313,33 +389,55 @@ const handleReconnect = async (e) => {
 };
 ```
 
-### 2. Keep-Alive 心跳机制
+### 3. 重连后需要手动重发 Subscription 消息
 
-**心跳配置：**
-- 用户可在 Settings 面板配置 `Keep Alive Interval`（毫秒）
-- 值为 0 表示禁用心跳
-- 心跳通过 WebSocket Ping 帧实现
+**关键限制**：
+1. 重连建立的是**全新的 WebSocket 连接**，与旧连接无状态关联
+2. 断线时消息队列已被清空，重连后不会自动重发
+3. GraphQL 协议层的 `connection_init`、`subscribe` 等消息需要用户手动重新发送
+4. 服务端不会记住之前的订阅状态
 
-**心跳实现：**
+**用户操作流程**：
+```
+网络断开 → URL 变化触发重连 → 新连接建立成功
+       ↓
+需要用户手动点击发送:
+  1. {"type":"connection_init"} 重新初始化连接
+  2. {"id":"1","type":"subscribe",...} 重新建立订阅
+```
+
+### 4. Keep-Alive 心跳机制的真实行为
+
+**纠正之前的错误表述**：
+
+Bruno 的 Keep-Alive 机制**仅发送 Ping 帧，不会主动检测超时或关闭连接**。
+
 ```javascript
 // 文件: packages/bruno-requests/src/ws/ws-client.js:307-313
 if (options.keepAlive) {
   const handle = setInterval(() => {
-    ws.isAlive = false;
-    ws.ping();  // 发送 Ping 帧
+    ws.isAlive = false;  // 设置标记但从未检查
+    ws.ping();           // 仅发送 Ping 帧
   }, options.keepAliveInterval);
 
   this.connectionKeepAlive.set(requestId, handle);
 }
 ```
 
-**Pong 响应处理（ws 库内置）：**
-- 服务端返回 Pong 帧时，`ws` 库自动更新连接状态
-- 若超时未收到 Pong，触发 `error` 或 `close` 事件
+**真实行为解析**：
+1. **发送 Ping**：按配置间隔定期发送 Ping 帧到服务端
+2. **接收 Pong**：ws 库内部自动响应 Pong，但 Bruno 代码中**没有监听 Pong 事件**
+3. **isAlive 标记**：设置了 `ws.isAlive = false`，但**从未在超时后检查该值**
+4. **无主动关闭**：没有实现 "若 N 秒未收到 Pong 则关闭连接" 的逻辑
 
-### 3. 连接状态管理
+**心跳的实际作用**：
+- 防止网络中间设备（如防火墙、NAT 网关）因连接空闲而断开
+- 被动检测连接状态（依赖底层 TCP 超时或 WebSocket close 事件）
+- **不具备主动断线检测和自动重连能力**
 
-**状态定义：**
+### 5. 连接状态管理
+
+**状态定义**：
 ```javascript
 // 文件: packages/bruno-app/src/components/RequestPane/WsQueryUrl/index.js:20-24
 const CONNECTION_STATUS = {
@@ -349,7 +447,7 @@ const CONNECTION_STATUS = {
 };
 ```
 
-**状态轮询：**
+**状态轮询**：
 ```javascript
 // 文件: packages/bruno-app/src/components/RequestPane/WsQueryUrl/index.js:26-38
 const useWsConnectionStatus = (requestId) => {
@@ -367,9 +465,9 @@ const useWsConnectionStatus = (requestId) => {
 };
 ```
 
-### 4. 主动清理机制
+### 6. 主动清理机制
 
-**连接关闭清理：**
+**连接关闭清理**：
 ```javascript
 // 文件: packages/bruno-requests/src/ws/ws-client.js:409-430
 #removeConnection(requestId) {
@@ -382,7 +480,7 @@ const useWsConnectionStatus = (requestId) => {
   // 2. 清空消息队列
   const mqId = this.#getMessageQueueId(requestId);
   if (mqId in this.messageQueues) {
-    this.messageQueues[mqId] = [];
+    this.messageQueues[mqId] = [];  // 队列被清空，重连后不会自动重发
   }
 
   // 3. 从活跃连接 Map 中移除
@@ -399,34 +497,40 @@ const useWsConnectionStatus = (requestId) => {
 }
 ```
 
-### 5. 重连时的消息保留策略
-
-**当前行为：**
-- 断线后消息队列被清空（`#removeConnection` 第 415-418 行）
-- 重连后需要用户重新发送订阅消息
-
-**建议的增强方案（可扩展）：**
-1. 断线时保存未发送的消息队列
-2. 重连成功后自动重发订阅消息
-3. 对 GraphQL subscription 类型自动发送 `connection_init` 和恢复订阅
-
 ---
 
 ## 总结
 
-### 核心优势
-1. **分层架构清晰**：Renderer ↔ Main Process ↔ Network 三层分离
-2. **消息队列可靠**：解决连接建立前后的时序问题
-3. **灵活的协议支持**：不绑定特定 GraphQL 协议，用户可自由配置
-4. **实时事件驱动**：基于 IPC 的事件分发，UI 响应及时
+### 核心能力现状
+| 能力 | 支持状态 | 说明 |
+|------|----------|------|
+| WebSocket 基础连接 | ✅ | 支持自定义 Header、协议、SSL |
+| 消息队列缓冲 | ✅ | 连接建立前缓存消息 |
+| 消息实时追加 | ✅ | 响应面板持续追加新消息 |
+| URL 变更自动重连 | ✅ | 变量插值变化触发重连 |
+| Keep-Alive 心跳 | ⚠️ | 仅发送 Ping，无超时检测 |
+| 网络断开自动重连 | ❌ | 需要 URL 变化或手动触发 |
+| 重连后自动恢复订阅 | ❌ | 需要手动重新发送协议消息 |
 
 ### 可改进点
-1. **自动重连增强**：目前仅支持 URL 变更触发，可增加网络恢复检测
-2. **GraphQL 协议自动化**：内置 graphql-ws 协议处理，自动处理 connection_init、心跳、重连后恢复订阅
-3. **消息持久化**：断线时保存订阅状态，重连后自动恢复
+1. **自动重连增强**：
+   - 监听网络状态变化（online/offline 事件）
+   - 实现指数退避重连策略
+   - 断线时保留未发送消息队列
+
+2. **GraphQL 协议自动化**：
+   - 内置 graphql-ws 协议处理器
+   - 自动发送 `connection_init` 保持连接
+   - 重连后自动恢复之前的订阅
+   - 管理订阅 ID 映射
+
+3. **心跳机制完善**：
+   - 监听 Pong 事件更新 `isAlive` 状态
+   - 实现超时检测（如 3 次心跳未响应则关闭）
+   - 触发自动重连逻辑
 
 ---
 
-**文档版本：** 1.0  
-**最后更新：** 2025-05-12  
-**适用版本：** Bruno v2.x+
+**文档版本**：1.1  
+**最后更新**：2025-05-12  
+**适用版本**：Bruno v2.x+
