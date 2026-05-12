@@ -327,9 +327,60 @@ wsResponseReceived: (state, action) => {
 ```
 
 **Step 7: UI 渲染**
-- ResponsePane 组件通过 `useSelector` 订阅 `item.response.responses`
+```javascript
+// 文件: packages/bruno-app/src/components/ResponsePane/WsResponsePane/WSMessagesList/index.js:177
+const WSMessagesList = ({ messages = [] }) => {
+  // ...
+  // 直接按数组顺序渲染，不进行任何排序
+  return (
+    <Virtuoso
+      data={messages}  // 直接使用传入的数组顺序
+      itemContent={renderItem}
+      computeItemKey={(_, msg) => msg.seq ?? msg.timestamp}  // 仅用作 React key
+      // ...
+    />
+  );
+};
+```
+
+**关键要点**：
+- ResponsePane 通过 `useSelector` 订阅 `item.response.responses`
 - 数组更新触发组件重渲染
-- 按 `seq` 序号排序后显示所有消息（包括历史消息和新消息）
+- **直接按数组追加顺序渲染**，不进行任何排序操作
+- `seq` 仅用作 React 的 `key` 属性（避免列表元素复用优化）
+
+### 4. seq 字段的真实作用与局限
+
+**seq 的生成机制**：
+```javascript
+// 文件: packages/bruno-requests/src/ws/ws-client.js:52-78
+const createSequencer = () => {
+  const seq = {};
+
+  const nextSeq = (requestId, collectionId) => {
+    seq[requestId] ||= {};
+    seq[requestId][collectionId] ||= 0;
+    return ++seq[requestId][collectionId];  // 按 requestId + collectionId 维度自增
+  };
+
+  const clean = (requestId, collectionId = undefined) => {
+    // 清理计数器
+  };
+
+  return { next: nextSeq, clean };
+};
+```
+
+**seq 的真实作用**：
+1. **React 列表渲染优化**：在 WSMessagesList 中用作 `computeItemKey`，帮助 React 识别稳定的列表元素标识
+2. **事件标识**：每个 WebSocket 事件（message/open/close/error/upgrade）都带有唯一 seq
+3. **调试追踪**：便于在日志或问题时追踪消息流向
+
+**seq 的局限**：
+1. **不用于排序**：渲染时直接使用数组顺序，不基于 seq 做任何排序
+2. **作用域有限**：每个 requestId + collectionId 组合维度自增，跨请求/跨集合不连续
+3. **断线重置**：连接关闭时调用 `seq.clean()`，重连后 seq 从 1 重新计数
+4. **非严格单调**：仅保证同一连接内事件发生时 seq 递增，但不保证绝对连续（因为 clean 可能被调用）
 
 ---
 
