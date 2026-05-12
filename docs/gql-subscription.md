@@ -399,16 +399,22 @@ updatedResponse.responses = (currentResponse?.responses || []).concat(eventData)
 ```
 
 **冲突发生过程**：
+```javascript
+// 代码确认: 所有事件类型共用同一个 requestId+collectionId 计数器
+// seq.next(requestId, collectionUid)  // open 同一连接内所有事件共享递增
 ```
-第一次连接:
+
+```
+第一次连接生命周期:
   seq=1 (open 事件)
-  seq=1 (message 事件) ← 注意：不同事件类型各自计数
-  seq=2 (message 事件)
-  seq=1 (close 事件)
-  ↓ 断线，seq.clean() 重置
-重连:
-  seq=1 (open 事件) ← 与历史 seq=1 重复
-  seq=1 (message 事件) ← 与历史 seq=1 重复
+  seq=2 (message 事件 - 发送)
+  seq=3 (message 事件 - 接收)
+  seq=4 (close 事件)
+  ↓ 断线触发 seq.clean(requestId, collectionUid) → 计数器被删除重置
+重连后:
+  seq=1 (open 事件) ← 与第1条消息的 seq=1 重复
+  seq=2 (message 事件) ← 与第2条消息的 seq=2 重复
+  ... 以此类推，重连后所有消息的 seq 都会与历史消息冲突
 ```
 
 **当前 computeItemKey 实现**：
@@ -652,6 +658,6 @@ const useWsConnectionStatus = (requestId) => {
 
 ---
 
-**文档版本**：1.2  
+**文档版本**：1.3  
 **最后更新**：2025-05-12  
 **适用版本**：Bruno v2.x+
