@@ -68,9 +68,11 @@ export const callIpc = (channel, ...args) => {
 |------|------|------|-----------|
 | 🔍 **已验证事实** | 代码中 `nodeIntegration: true` 且 `contextIsolation: true` 同时存在 | ✅ 客观证据 | 直接读取 `index.js:234-238` 代码 |
 | 🔍 **已验证事实** | Preload 脚本仅通过 `contextBridge.exposeInMainWorld` 暴露有限接口 | ✅ 客观证据 | 直接读取 `preload.js` 全文 |
-| 🔍 **已验证事实** | 渲染进程所有文件操作都通过 `window.ipcRenderer.invoke` 调用 | ✅ 客观证据 | 搜索 `bruno-app` 目录下所有 `.js` 文件 |
-| 📌 **推论（需前提）** | 渲染进程无法直接访问 Node.js `fs`、`path` 等模块 | ⚠️ 依赖前提 | 前提：Electron 版本 ≥ 12 且 contextIsolation 机制按文档工作 |
-| 📌 **推论（需前提）** | `contextIsolation: true` 的优先级高于 `nodeIntegration: true` | ⚠️ 依赖前提 | 前提：Electron 官方文档描述的行为与实际一致 |
+| 🔍 **已验证事实** | 渲染进程所有文件系统操作都通过 `window.ipcRenderer.invoke` 调用 | ✅ 客观证据 | 搜索 `bruno-app/src` 目录下所有文件操作相关代码 |
+| 🔍 **已验证事实** | `bruno-app/src` 目录下无 `require('fs')` 或 `import from 'fs'` 引用 | ✅ 客观证据 | 搜索 `bruno-app/src` 目录所有 `.js/.jsx` 文件 |
+| 📌 **观察事实** | `bruno-app/src/utils/common/path.js` 有 `import path from 'path'`，但仅做字符串路径运算（.relative/.resolve/.basename），无文件系统访问 | ✅ 客观证据 | 直接阅读 `path.js` 全文（仅字符串处理，无 I/O 操作） |
+| 📌 **推论（需前提）** | 渲染进程的 `path` 模块为打包工具提供的 polyfill，非 Node.js 原生实现 | ⚠️ 依赖前提 | 前提：Electron + Vite/Webpack 构建环境行为 |
+| 📌 **推论（需前提）** | `contextIsolation: true` 限制了对 Node.js 原生模块的直接访问 | ⚠️ 依赖前提 | 前提：Electron 官方文档描述的行为与实际一致 |
 
 > 📋 **非绝对化声明**：以上"推论"结论基于 Electron 官方文档的标准行为假设。如 Electron 内部实现发生变化或存在特定绕过方式，上述推论可能不成立。
 
