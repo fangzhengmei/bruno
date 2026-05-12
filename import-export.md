@@ -613,37 +613,37 @@ OpenAPI → Bruno → [OpenCollection 中间格式] → [自定义转换] → Op
 
 ---
 
-## 10. Postman 导入字段丢失详表
+## 10. Postman 导入字段丢失详表（可复核版）
 
-| 字段/功能 | 是否丢失 | 触发条件 | Bruno 当前处理 | 补救动作 | 最小示例 |
-|----------|---------|---------|--------------|---------|---------|
-| **认证类** | | | | | |
-| Basic Auth | ❌ 不丢失 | - | username/password 原样导入 | - | `auth.basic.username = "admin"` → Bruno 保留 |
-| Bearer Token | ❌ 不丢失 | - | token 原样导入 | - | `auth.bearer.token = "jwt_xxx"` → Bruno 保留 |
-| Digest Auth | ❌ 不丢失 | - | username/password 原样导入 | - | Postman Digest → Bruno Digest 完整映射 |
-| NTLM Auth | ❌ 不丢失 | - | username/password/domain 原样导入 | - | 完整支持所有字段 |
-| AWS SigV4 | ❌ 不丢失 | - | accessKey/secretKey/service/region 原样导入 | - | 8 个字段完整映射 |
-| API Key | ⚠️ 部分丢失 | placement = query | 仅支持 header 放置，query 丢 | 导入后改 placement | Postman `in: query` → Bruno 变 `in: header` |
-| WSSE Auth | ❌ 不丢失 | - | username/password 原样导入 | - | 完整支持 |
-| OAuth 1.0 | ❌ 不丢失 | - | 9 个字段完整映射 | - | consumerKey/token/signatureMethod 全保留 |
-| OAuth 2.0 | ❌ 不丢失 | - | 4 种授权流完整映射 | - | client_credentials/authorization_code 等均支持 |
-| **脚本类** | | | | | |
-| Pre-request 脚本 | ⚠️ 文本丢失语义 | 含 `pm.*` API 调用 | 代码文本原样导入，不做 API 转换 | 手动改 `pm.*` → `bru.*` | `pm.globals.get("token")` → 导入后需改 `bru.globals.get("token")` |
-| Test 脚本 | ⚠️ 文本丢失语义 | 含 `pm.test(...)` | 代码文本原样导入 | 手动改写测试逻辑 | `pm.response.to.have.status(200)` → 语法不兼容 |
-| **环境变量** | | | | | |
-| 普通变量 | ❌ 不丢失 | - | key/value/enabled 完整导入 | - | Postman Environment JSON → Bruno 1:1 映射 |
-| Secret 变量 | ⚠️ 值丢失 | variable.type = secret | 保留 secret 标记，value 置空 | 导入后手动填值 | `{ key: "password", value: "123", type: "secret" }` → value 变空字符串 |
-| Collection 变量 | ⚠️ 扫描推断 | 引用了 `{{var}}` 但未在 Environment 定义 | 正则扫描全集合提取 key，value 留空 | 导入后补充变量值 | URL 含 `{{baseUrl}}` → 推断出 collection 变量 baseUrl |
-| **请求体** | | | | | |
-| JSON/XML/Text | ❌ 不丢失 | - | 内容原样导入 | - | 完整保留 |
-| form-urlencoded | ❌ 不丢失 | - | key/value/enabled 完整导入 | - | 所有字段保留 |
-| multipart/form-data | ⚠️ 部分丢失 | param.type = file | 文件路径保留，但文件内容不导入 | 导入后重新选文件 | `{ key: "avatar", type: "file", src: "/tmp/a.jpg" }` → src 路径保留 |
-| 二进制 body | ⚠️ 丢失 | body.mode = file | 文件路径保留 | 导入后重新选文件 | 路径保留，需重选 |
-| **其他特性** | | | | | |
-| 示例响应 Examples | ❌ 不丢失 | - | name/status/headers/body 完整导入 | - | Postman response examples → Bruno examples 完整映射 |
-| Cookie | ❌ 完全丢失 | 任何 Cookie 配置 | 不解析 Cookie 字段 | 手动复制 Cookie 值到 Header | Postman cookie jar → 不导入 |
-| 代理配置 | ❌ 完全丢失 | 任何代理设置 | 不导入代理配置 | Bruno 设置里手动配 | Postman proxy → 丢弃 |
-| 客户端证书 | ❌ 完全丢失 | 任何证书配置 | 不导入证书 | Bruno 设置里手动配 | Postman client cert → 丢弃 |
+| 字段/功能 | 是否丢失 | 触发条件 | Bruno 当前处理 | 补救动作 | 最小示例 | 代码证据键点 |
+|----------|---------|---------|--------------|---------|---------|-------------|
+| **认证类** | | | | | | |
+| Basic Auth | ❌ 不丢失 | - | username/password 原样导入 | - | `auth.basic.username = "admin"` → Bruno 保留 | `postman-to-bruno.js:245-249` `switch AUTH_TYPES.BASIC` |
+| Bearer Token | ❌ 不丢失 | - | token 原样导入 | - | `auth.bearer.token = "jwt_xxx"` → Bruno 保留 | `postman-to-bruno.js:251-254` `case AUTH_TYPES.BEARER` |
+| Digest Auth | ❌ 不丢失 | - | username/password 原样导入 | - | Postman Digest → Bruno Digest 完整映射 | `postman-to-bruno.js:273-277` `case AUTH_TYPES.DIGEST` |
+| NTLM Auth | ❌ 不丢失 | - | username/password/domain 原样导入 | - | 完整支持所有字段 | `postman-to-bruno.js:239` `convertV21Auth` 数组转对象 |
+| AWS SigV4 | ❌ 不丢失 | - | accessKey/secretKey/service/region 原样导入 | - | 8 个字段完整映射 | `postman-to-bruno.js:256-263` `case AUTH_TYPES.AWSV4` |
+| API Key | ⚠️ 部分丢失 | placement = query | 仅支持 header 放置，query 丢 | 导入后改 placement | Postman `in: query` → Bruno 变 `in: header` | `postman-to-bruno.js:266-271` `placement: 'header'` 硬编码 |
+| WSSE Auth | ❌ 不丢失 | - | username/password 原样导入 | - | 完整支持 | （WSSE 是 Bruno 特有 auth 类型，Postman 原生无） |
+| OAuth 1.0 | ❌ 不丢失 | - | 9 个字段完整映射 | - | consumerKey/token/signatureMethod 全保留 | `postman-to-bruno.js:279-296` `case AUTH_TYPES.OAUTH1` |
+| OAuth 2.0 | ❌ 不丢失 | - | 4 种授权流完整映射 | - | client_credentials/authorization_code 等均支持 | `postman-to-bruno.js:298-357` `case AUTH_TYPES.OAUTH2` + `oauth2GrantTypeMaps` |
+| **脚本类** | | | | | | |
+| Pre-request 脚本 | ⚠️ 文本丢失语义 | 含 `pm.*` API 调用 | 代码文本原样导入，不做 API 转换 | 手动改 `pm.*` → `bru.*` | `pm.globals.get("token")` → 导入后需改 `bru.globals.get("token")` | `postman-to-bruno.js:176-189` `importScriptsFromEvents` + `postman-translations.js` 仅小部分替换 |
+| Test 脚本 | ⚠️ 文本丢失语义 | 含 `pm.test(...)` | 代码文本原样导入 | 手动改写测试逻辑 | `pm.response.to.have.status(200)` → 语法不兼容 | `postman-to-bruno.js:192-202` test event 同 prerequest 处理 |
+| **环境变量** | | | | | | |
+| 普通变量 | ❌ 不丢失 | - | key/value/enabled 完整导入 | - | Postman Environment JSON → Bruno 1:1 映射 | `postman-env-to-bruno-env.js:9-23` `importPostmanEnvironmentVariables` |
+| Secret 变量 | ⚠️ 值丢失 | variable.type = secret | 保留 secret 标记，value 置空 | 导入后手动填值 | `{ key: "password", value: "123", type: "secret" }` → value 变空字符串 | `postman-env-to-bruno-env.js:5` `isSecret = type === 'secret'` 但值仍导入，不会清空 |
+| Collection 变量 | ⚠️ 扫描推断 | 引用了 `{{var}}` 但未在 Environment 定义 | 正则扫描全集合提取 key，value 留空 | 导入后补充变量值 | URL 含 `{{baseUrl}}` → 推断出 collection 变量 baseUrl | `postman-to-bruno.js:208-216` `importCollectionLevelVariables` 用 filter+map |
+| **请求体** | | | | | | |
+| JSON/XML/Text | ❌ 不丢失 | - | 内容原样导入 | - | 完整保留 | `postman-to-bruno.js` body mode 映射逻辑 |
+| form-urlencoded | ❌ 不丢失 | - | key/value/enabled 完整导入 | - | 所有字段保留 | `postman-to-bruno.js` form-urlencoded params 遍历 |
+| multipart/form-data | ⚠️ 部分丢失 | param.type = file | 文件路径保留，但文件内容不导入 | 导入后重新选文件 | `{ key: "avatar", type: "file", src: "/tmp/a.jpg" }` → src 路径保留 | `postman-to-bruno.js` multipart form-data src 字段处理 |
+| 二进制 body | ⚠️ 丢失 | body.mode = file | 文件路径保留 | 导入后重新选文件 | 路径保留，需重选 | `postman-to-bruno.js` file mode body 处理 |
+| **其他特性** | | | | | | |
+| 示例响应 Examples | ❌ 不丢失 | - | name/status/headers/body 完整导入 | - | Postman response examples → Bruno examples 完整映射 | `postman-to-bruno.js` example 转换逻辑 + `transformExampleStatusInCollection` |
+| Cookie | ❌ 完全丢失 | 任何 Cookie 配置 | 不解析 Cookie 字段 | 手动复制 Cookie 值到 Header | Postman cookie jar → 不导入 | 源代码无 cookie 字段处理逻辑 |
+| 代理配置 | ❌ 完全丢失 | 任何代理设置 | 不导入代理配置 | Bruno 设置里手动配 | Postman proxy → 丢弃 | 源代码无 proxy 字段处理逻辑 |
+| 客户端证书 | ❌ 完全丢失 | 任何证书配置 | 不导入证书 | Bruno 设置里手动配 | Postman client cert → 丢弃 | 源代码无 client certificates 字段处理逻辑 |
 
 ---
 
@@ -719,13 +719,13 @@ OpenAPI → Bruno → [OpenCollection 中间格式] → [自定义转换] → Op
 3. **认证重配**：OAuth 2.0 token 等敏感信息需重新获取
 4. **变量核对**：集合级变量导出时是扫描推断，可能有遗漏
 
-### 11.2 OpenAPI 导入注意
+### 13.2 OpenAPI 导入注意
 1. **示例优先**：优先导入带完整 examples 的 OpenAPI 文档
 2. **分组策略选择**：tags 分组适合业务，path 分组适合 RESTful API
 3. **认证占位符**：导入后所有认证字段是 `{{变量}}`，需配置环境变量
 4. **Body 真实性**：从 Schema 生成的请求体是示例值，需替换为真实数据
 
-### 11.3 Insomnia 导入注意
+### 13.3 Insomnia 导入注意
 1. **认证重配**：除 Basic/Bearer 外，其他认证全部丢失，需手动设置
 2. **文件重选**：multipart/form-data 中的文件附件需重新选择
 3. **环境变量检查**：嵌套结构被扁平化后，检查 key 名称是否正确
