@@ -78,6 +78,10 @@ const RequestTabPanel = () => {
 - `QueryUrl`（HTTP/GraphQL）→ `packages/bruno-app/src/components/RequestPane/QueryUrl/index.js`
 - `GrpcQueryUrl` → `packages/bruno-app/src/components/RequestPane/GrpcQueryUrl/index.js`
 - `WsQueryUrl` → `packages/bruno-app/src/components/RequestPane/WsQueryUrl/index.js`
+- `HttpRequestPane` → `packages/bruno-app/src/components/RequestPane/HttpRequestPane/index.js`
+- `GraphQLRequestPane` → `packages/bruno-app/src/components/RequestPane/GraphQLRequestPane/index.js`
+- `GrpcRequestPane` → `packages/bruno-app/src/components/RequestPane/GrpcRequestPane/index.js`
+- `WSRequestPane` → `packages/bruno-app/src/components/RequestPane/WSRequestPane/index.js`
 
 ### 1.3 统一发送触发：handleRun
 
@@ -268,7 +272,7 @@ const runRequest = async ({ item, collection, envVars, processEnvVars, runtimeVa
   }
 
   // 第 845-854 行：configureRequest - HTTP 版本（在同一文件内定义，第 101 行）
-  // 功能：代理配置、SSL/TLS 证书、OAuth1/OAuth2 认证、NTLM 等
+  // 功能：代理配置、SSL/TLS 证书、OAuth1/OAuth2 认证、NTLM、Axios 实例配置
   const axiosInstance = await configureRequest(
     collectionUid,
     collection,
@@ -293,6 +297,7 @@ const runRequest = async ({ item, collection, envVars, processEnvVars, runtimeVa
 - `prepareRequest` → `packages/bruno-electron/src/ipc/network/prepare-request.js`
 - `configureRequest` (HTTP 版本) → `packages/bruno-electron/src/ipc/network/index.js:101`
 - `makeAxiosInstance` → `packages/bruno-electron/src/ipc/network/axios-instance.js`
+- `axios-instance` 源实现 → `packages/bruno-requests/src/network/axios-instance.ts`
 
 ### 2.3 gRPC 传输链路
 
@@ -323,7 +328,7 @@ export const startGrpcRequest = async (item, collection, environment, runtimeVar
 };
 ```
 
-#### 2.3.2 主进程 gRPC 连接处理 + configureRequest (gRPC 版本)
+#### 2.3.2 主进程 gRPC 连接处理 + 客户端实现
 
 ```javascript
 // 文件: packages/bruno-electron/src/ipc/network/grpc-event-handlers.js:155-259
@@ -344,7 +349,8 @@ ipcMain.handle('grpc:start-connection', async (event, { request, collection, env
     certsAndProxyConfig
   );
 
-  // 第 222-234 行：启动 gRPC 连接
+  // 第 223-234 行：启动 gRPC 连接
+  // grpcClient 来自 @usebruno/requests 包，源文件见下文
   await grpcClient.startConnection({
     request: preparedRequest,
     collection,
@@ -359,10 +365,12 @@ ipcMain.handle('grpc:start-connection', async (event, { request, collection, env
 });
 ```
 
-**关键函数位置**：
+**gRPC 客户端实现位置**（关键修正）：
+- `GrpcClient` 导出 → `packages/bruno-requests/src/index.ts:2`
+- `GrpcClient` 源实现 → `packages/bruno-requests/src/grpc/grpc-client.js`
+- `GrpcClient` 入口模块 → `packages/bruno-requests/src/grpc/index.ts`
 - `prepareGrpcRequest` → `packages/bruno-electron/src/ipc/network/prepare-grpc-request.js`
-- `configureRequest` (gRPC 版本) → `packages/bruno-electron/src/ipc/network/prepare-grpc-request.js:32`
-- `grpcClient` → `packages/bruno-electron/src/ipc/network/grpc-client.js`
+- `configureRequest` (gRPC 版本，OAuth2 处理) → `packages/bruno-electron/src/ipc/network/prepare-grpc-request.js:32`
 
 ### 2.4 WebSocket 传输链路
 
@@ -394,14 +402,15 @@ export const connectWS = async (item, collection, environment, runtimeVariables,
 };
 ```
 
-#### 2.4.2 主进程 WebSocket 处理
+#### 2.4.2 主进程 WebSocket 处理 + 客户端实现
 
 ```javascript
 // 文件: packages/bruno-electron/src/ipc/network/ws-event-handlers.js:303-388
 ipcMain.handle(
   'renderer:ws:start-connection',
   async (event, { request, collection, environment, runtimeVariables, settings, options = {} }) => {
-    // 第 308 行：请求准备
+    // 第 27-215 行：prepareWsRequest - WebSocket 请求预处理（在同一文件内定义）
+    // 功能：合并 headers/scripts/vars/auth，设置认证头，OAuth2 token 处理，子协议配置
     const preparedRequest = await prepareWsRequest(requestCopy, collection, environment, runtimeVariables, {});
 
     // 第 318-325 行：自动发送预定义消息
@@ -415,6 +424,7 @@ ipcMain.handle(
     }
 
     // 第 328-360 行：获取 SSL 配置并启动连接
+    // wsClient 来自 @usebruno/requests 包，源文件见下文
     const certsAndProxyConfig = await getCertsAndProxyConfig(...);
     const sslOptions = { rejectUnauthorized: preferencesUtil.shouldVerifyTls(), ... };
 
@@ -430,9 +440,10 @@ ipcMain.handle(
 );
 ```
 
-**关键函数位置**：
-- `prepareWsRequest` → `packages/bruno-electron/src/ipc/network/prepare-ws-request.js`
-- `wsClient` → `packages/bruno-electron/src/ipc/network/ws-client.js`
+**WebSocket 关键实现位置**（关键修正）：
+- `WsClient` 导出 → `packages/bruno-requests/src/index.ts:3`
+- `WsClient` 源实现 → `packages/bruno-requests/src/ws/ws-client.js`
+- `prepareWsRequest`（WebSocket 请求预处理）→ `packages/bruno-electron/src/ipc/network/ws-event-handlers.js:27-215`（在同一文件内定义）
 
 ---
 
@@ -498,10 +509,12 @@ const ResponsePane = ({ item, collection }) => {
 **通用组件位置**：
 - `StatusCode` → `packages/bruno-app/src/components/ResponsePane/StatusCode/index.js`
 - `ResponseTime` → `packages/bruno-app/src/components/ResponsePane/ResponseTime/index.js`
+- `ResponseStopWatch` → `packages/bruno-app/src/components/ResponsePane/ResponseStopWatch/index.js`
 - `ResponseSize` → `packages/bruno-app/src/components/ResponsePane/ResponseSize/index.js`
 - `Timeline` → `packages/bruno-app/src/components/ResponsePane/Timeline/index.js`
 - `QueryResult` → `packages/bruno-app/src/components/ResponsePane/QueryResult/index.js`
 - `ResponseHeaders` → `packages/bruno-app/src/components/ResponsePane/ResponseHeaders/index.js`
+- `TestResults` → `packages/bruno-app/src/components/ResponsePane/TestResults/index.js`
 
 #### 3.2.2 GrpcResponsePane：gRPC 专用面板
 
@@ -644,15 +657,25 @@ gRPC 和 WebSocket 采用事件驱动架构更新响应状态：
 └─────────────────────────────────────────────────────────────────────────────┘  │
                                                                                    │
 ┌─────────────────────────────────────────────────────────────────────────────┐  │
-│                             主进程层 (Main)                                   │  │
+│                          主进程层 (Main - Electron)                          │  │
 ├─────────────────────────────────────────────────────────────────────────────┤  │
 │  ipcMain.handle(...)                                                         │  │
-│    ├── send-http-request (index.js:1205)                                    │  │
+│    ├── send-http-request (network/index.js:1205)                           │  │
 │    │   └── runRequest ──► prepareRequest ──► configureRequest ──► axios    │  │
-│    ├── grpc:start-connection (grpc-event-handlers.js:155)                  │  │
-│    │   └── prepareGrpcRequest ──► configureRequest ──► grpcClient          │  │
-│    └── renderer:ws:start-connection (ws-event-handlers.js:303)             │  │
-│        └── prepareWsRequest ──► wsClient.startConnection()                 │  │
+│    ├── grpc:start-connection (grpc-event-handlers.js:155)                 │  │
+│    │   └── prepareGrpcRequest ──► configureRequest ──► GrpcClient          │  │
+│    └── renderer:ws:start-connection (ws-event-handlers.js:303)            │  │
+│        └── prepareWsRequest ──► WsClient.startConnection()                 │  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                                                   │
+┌─────────────────────────────────────────────────────────────────────────────┐  │
+│                         @usebruno/requests 核心库层                           │  │
+├─────────────────────────────────────────────────────────────────────────────┤  │
+│  packages/bruno-requests/src/                                                │  │
+│    ├── grpc/grpc-client.js ←───┐                                            │  │
+│    ├── ws/ws-client.js ←───────┤  协议客户端实现                              │  │
+│    ├── network/axios-instance.ts ←┘                                          │  │
+│    └── index.ts (统一导出入口)                                              ◄──┘
 └─────────────────────────────────────────────────────────────────────────────┘
                                                                                    │
 ┌─────────────────────────────────────────────────────────────────────────────┐  │
@@ -669,7 +692,7 @@ gRPC 和 WebSocket 采用事件驱动架构更新响应状态：
 | 原则 | 实现方式 | 文件位置 |
 |------|---------|---------|
 | **入口统一** | 所有协议通过相同的 handleRun → sendRequest 路径 | RequestTabPanel.js:428 |
-| **职责分离** | 协议分发在 Action 层，传输实现各自封装 | network/index.js 各分支 |
+| **职责分离** | 协议分发在 Action 层，传输实现封装在 `@usebruno/requests` | network/index.js 各分支 |
 | **状态归一** | 所有协议响应最终汇入同一个 responseReceived reducer | collections/index.js:527 |
 | **展示复用** | StatusCode、Timeline 等组件跨协议共享，专用面板继承扩展 | ResponsePane/ 目录 |
 | **错误一致** | 所有协议错误都映射为相同结构，使用统一 NetworkError toast | actions.js:613-645 |
@@ -678,22 +701,17 @@ gRPC 和 WebSocket 采用事件驱动架构更新响应状态：
 
 | 协议 | 文件位置 | 主要职责 |
 |------|---------|---------|
-| HTTP/GraphQL | `bruno-electron/src/ipc/network/index.js:101` | 代理配置、SSL/TLS、OAuth1/OAuth2、NTLM、axios 实例配置 |
+| HTTP/GraphQL | `bruno-electron/src/ipc/network/index.js:101` | 代理配置、SSL/TLS、OAuth1/OAuth2、NTLM、Axios 实例配置 |
 | gRPC | `bruno-electron/src/ipc/network/prepare-grpc-request.js:32` | OAuth2 token 获取、token 放置位置（header/query） |
 
-### 4.4 各协议进入统一生命周期的关键点
+### 4.4 核心客户端库位置汇总（@usebruno/requests）
 
-1. **HTTP/GraphQL**：
-   - 同步请求-响应模式
-   - 调用链：`sendRequest` → `sendNetworkRequest` → IPC → `runRequest` → Promise 返回 → `responseReceived`
-
-2. **gRPC**：
-   - 事件驱动模式
-   - 调用链：`sendRequest` → `sendGrpcRequest` → IPC → `grpcClient.startConnection()` → 事件 → `responseReceived`
-
-3. **WebSocket**：
-   - 事件驱动 + 消息队列模式
-   - 调用链：`sendRequest` → `sendWsRequest` → 确保连接 → `queueWsMessage` → 事件 → `responseReceived`
+| 组件 | 文件路径 | 功能 |
+|------|---------|------|
+| **GrpcClient** | `packages/bruno-requests/src/grpc/grpc-client.js` | gRPC 连接管理、流式调用、消息收发 |
+| **WsClient** | `packages/bruno-requests/src/ws/ws-client.js` | WebSocket 连接管理、消息队列、心跳检测 |
+| **axios-instance** | `packages/bruno-requests/src/network/axios-instance.ts` | HTTP 客户端代理配置、Keep-Alive、证书 |
+| **统一导出** | `packages/bruno-requests/src/index.ts` | 所有客户端类和工具函数的导出入口 |
 
 ---
 
