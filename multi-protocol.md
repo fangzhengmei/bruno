@@ -33,7 +33,7 @@ const RequestTabPanel = () => {
   const isGrpcRequest = item?.type === 'grpc-request';
   const isWsRequest = item?.type === 'ws-request';
 
-  // 第 452-460 行：渲染 URL 栏（含发送按钮）
+  // 第 452-460 行：渲染 URL 栏（含发送触发）
   const renderQueryUrl = () => {
     if (isGrpcRequest) {
       return <GrpcQueryUrl item={item} collection={collection} handleRun={handleRun} />;
@@ -102,11 +102,12 @@ const handleRun = async () => {
     return;
   }
 
-  // 统一发送入口
+  // 统一发送入口 → 进入传输层
   if (item.requestState !== 'sending' && item.requestState !== 'queued') {
     dispatch(sendRequest(item, collection.uid)).catch((err) =>
-      toast.custom((t) => <NetworkError ... />, { duration: 5000 })
-    );
+      toast.custom((t) => <NetworkError onClose={() => toast.dismiss(t.id)} />, {
+        duration: 5000
+      }));
   }
 };
 ```
@@ -129,17 +130,17 @@ export const sendRequest = (item, collectionUid) => (dispatch, getState) => {
   const isWsRequest = itemCopy.type === 'ws-request';
 
   if (isGrpcRequest) {
-    // 第 578-583 行：gRPC 分支
+    // 第 578-583 行：gRPC 分支 → gRPC 传输层
     sendGrpcRequest(itemCopy, collectionCopy, environment, collectionCopy.runtimeVariables)
       .then(resolve)
       .catch((err) => { toast.error(err.message); });
   } else if (isWsRequest) {
-    // 第 584-589 行：WebSocket 分支
+    // 第 584-589 行：WebSocket 分支 → WebSocket 传输层
     sendWsRequest(itemCopy, collectionCopy, environment, collectionCopy.runtimeVariables)
       .then(resolve)
       .catch((err) => { toast.error(err.message); });
   } else {
-    // 第 590-646 行：HTTP/GraphQL 分支
+    // 第 590-646 行：HTTP/GraphQL 分支 → HTTP 传输层
     sendNetworkRequest(itemCopy, collectionCopy, environment, collectionCopy.runtimeVariables)
       .then((response) => {
         const { requestSent, ...responseData } = response;
@@ -154,6 +155,16 @@ export const sendRequest = (item, collectionUid) => (dispatch, getState) => {
       })
       .catch((err) => {
         // 错误归一化处理
+        const request = itemCopy.draft?.request || itemCopy.request;
+        const requestSent = request ? { url: request.url, method: request.method } : undefined;
+
+        // 取消请求的特殊处理
+        if (err && err.message === 'Error invoking remote method \'send-http-request\': Error: Request cancelled') {
+          dispatch(responseReceived({ itemUid, collectionUid, response: null, requestSent }));
+          return;
+        }
+
+        // 统一错误响应结构
         const errorResponse = {
           status: 'Error',
           isError: true,
@@ -168,9 +179,9 @@ export const sendRequest = (item, collectionUid) => (dispatch, getState) => {
 ```
 
 **调用关系**：
-- `sendNetworkRequest` → `packages/bruno-app/src/utils/network/index.js:1`
-- `sendGrpcRequest` → `packages/bruno-app/src/utils/network/index.js:31`
-- `sendWsRequest` → `packages/bruno-app/src/utils/network/index.js:227`
+- `sendNetworkRequest` → `packages/bruno-app/src/utils/network/index.js:1-29`
+- `sendGrpcRequest` → `packages/bruno-app/src/utils/network/index.js:31-44`
+- `sendWsRequest` → `packages/bruno-app/src/utils/network/index.js:227-245`
 
 ### 2.2 HTTP/GraphQL 传输链路
 
@@ -190,7 +201,7 @@ export const sendNetworkRequest = async (item, collection, environment, runtimeV
           resolve({
             state: 'success',
             data: response.data,
-            dataBuffer: response.dataBuffer,  // Base64 编码，用于 Redux 存储
+            dataBuffer: response.dataBuffer,
             headers: response.headers,
             size: response.size,
             status: response.status,
@@ -240,7 +251,7 @@ ipcMain.handle('send-http-request', async (event, item, collection, environment,
 });
 ```
 
-#### 2.2.3 runRequest：完整请求生命周期
+#### 2.2.3 runRequest：完整请求生命周期 + configureRequest
 
 ```javascript
 // 文件: packages/bruno-electron/src/ipc/network/index.js:737-940
@@ -256,8 +267,18 @@ const runRequest = async ({ item, collection, envVars, processEnvVars, runtimeVa
     preRequestError = error;
   }
 
-  // 第 845 行：Axios 实例配置（代理、SSL、证书等）
-  const axiosInstance = await configureRequest(...);
+  // 第 845-854 行：configureRequest - HTTP 版本（在同一文件内定义，第 101 行）
+  // 功能：代理配置、SSL/TLS 证书、OAuth1/OAuth2 认证、NTLM 等
+  const axiosInstance = await configureRequest(
+    collectionUid,
+    collection,
+    request,
+    envVars,
+    runtimeVariables,
+    processEnvVars,
+    collectionPath,
+    collection.globalEnvironmentVariables
+  );
 
   // 第 901-939 行：实际发送请求
   response = await axiosInstance(request);
@@ -268,9 +289,10 @@ const runRequest = async ({ item, collection, envVars, processEnvVars, runtimeVa
 };
 ```
 
-**调用关系**：
+**关键函数位置**：
 - `prepareRequest` → `packages/bruno-electron/src/ipc/network/prepare-request.js`
-- `configureRequest` → `packages/bruno-electron/src/ipc/network/configure-request.js`
+- `configureRequest` (HTTP 版本) → `packages/bruno-electron/src/ipc/network/index.js:101`
+- `makeAxiosInstance` → `packages/bruno-electron/src/ipc/network/axios-instance.js`
 
 ### 2.3 gRPC 传输链路
 
@@ -301,24 +323,34 @@ export const startGrpcRequest = async (item, collection, environment, runtimeVar
 };
 ```
 
-#### 2.3.2 主进程 gRPC 连接处理
+#### 2.3.2 主进程 gRPC 连接处理 + configureRequest (gRPC 版本)
 
 ```javascript
-// 文件: packages/bruno-electron/src/ipc/network/grpc-event-handlers.js:155-250
+// 文件: packages/bruno-electron/src/ipc/network/grpc-event-handlers.js:155-259
 ipcMain.handle('grpc:start-connection', async (event, { request, collection, environment, runtimeVariables }) => {
   // 第 158 行：请求准备
   const preparedRequest = await prepareGrpcRequest(requestCopy, collection, environment, runtimeVariables, {});
 
-  // 第 166-186 行：获取证书和代理配置
+  // 第 166-186 行：获取证书和代理配置 + 调用 configureRequest (gRPC 专用版本)
   const certsAndProxyConfig = await getCertsAndProxyConfig(...);
-  await configureRequest(preparedRequest, requestCopy, collection, ...);
+  await configureRequest(
+    preparedRequest,
+    requestCopy,
+    collection,
+    preparedRequest.envVars,
+    runtimeVariables,
+    preparedRequest.processEnvVars,
+    preparedRequest.promptVariables,
+    certsAndProxyConfig
+  );
 
   // 第 222-234 行：启动 gRPC 连接
   await grpcClient.startConnection({
     request: preparedRequest,
     collection,
-    rootCertificate, privateKey, certificateChain, passphrase, pfx, verifyOptions,
-    includeDirs, proxyConfig: grpcProxyConfig
+    rootCertificate, privateKey, certificateChain, passphrase, pfx,
+    verifyOptions, includeDirs,
+    proxyConfig: grpcProxyConfig
   });
 
   // 第 236 行：发送请求事件到时间线
@@ -327,7 +359,10 @@ ipcMain.handle('grpc:start-connection', async (event, { request, collection, env
 });
 ```
 
-**注意**：gRPC 采用事件驱动架构，响应数据通过 `grpc:*` 事件（而非 Promise 返回）异步更新到 Redux。
+**关键函数位置**：
+- `prepareGrpcRequest` → `packages/bruno-electron/src/ipc/network/prepare-grpc-request.js`
+- `configureRequest` (gRPC 版本) → `packages/bruno-electron/src/ipc/network/prepare-grpc-request.js:32`
+- `grpcClient` → `packages/bruno-electron/src/ipc/network/grpc-client.js`
 
 ### 2.4 WebSocket 传输链路
 
@@ -379,11 +414,10 @@ ipcMain.handle(
       }
     }
 
-    // 第 328-348 行：获取 SSL 配置
+    // 第 328-360 行：获取 SSL 配置并启动连接
     const certsAndProxyConfig = await getCertsAndProxyConfig(...);
     const sslOptions = { rejectUnauthorized: preferencesUtil.shouldVerifyTls(), ... };
 
-    // 第 351-360 行：启动 WebSocket 连接
     await wsClient.startConnection({
       request: preparedRequest, collection,
       options: { timeout: settings.timeout, keepAlive: settings.keepAliveInterval > 0, keepAliveInterval: settings.keepAliveInterval, sslOptions }
@@ -396,7 +430,9 @@ ipcMain.handle(
 );
 ```
 
-**注意**：WebSocket 同样采用事件驱动架构，消息收发通过 `main:ws:*` 事件异步更新。
+**关键函数位置**：
+- `prepareWsRequest` → `packages/bruno-electron/src/ipc/network/prepare-ws-request.js`
+- `wsClient` → `packages/bruno-electron/src/ipc/network/ws-client.js`
 
 ---
 
@@ -459,11 +495,13 @@ const ResponsePane = ({ item, collection }) => {
 };
 ```
 
-**通用组件**：
+**通用组件位置**：
 - `StatusCode` → `packages/bruno-app/src/components/ResponsePane/StatusCode/index.js`
 - `ResponseTime` → `packages/bruno-app/src/components/ResponsePane/ResponseTime/index.js`
 - `ResponseSize` → `packages/bruno-app/src/components/ResponsePane/ResponseSize/index.js`
 - `Timeline` → `packages/bruno-app/src/components/ResponsePane/Timeline/index.js`
+- `QueryResult` → `packages/bruno-app/src/components/ResponsePane/QueryResult/index.js`
+- `ResponseHeaders` → `packages/bruno-app/src/components/ResponsePane/ResponseHeaders/index.js`
 
 #### 3.2.2 GrpcResponsePane：gRPC 专用面板
 
@@ -475,8 +513,16 @@ const GrpcResponsePane = ({ item, collection, response }) => {
   <GrpcResponseHeaders headers={response.metadata} />      // Metadata 展示
   <GrpcQueryResult messages={response.messages} />         // 流式消息列表
   <ResponseTrailers trailers={response.trailers} />        // Trailers 展示
+  <GrpcError error={response.error} />                     // gRPC 错误展示
 };
 ```
+
+**gRPC 专用组件位置**：
+- `GrpcStatusCode` → `packages/bruno-app/src/components/ResponsePane/GrpcResponsePane/GrpcStatusCode/index.js`
+- `GrpcResponseHeaders` → `packages/bruno-app/src/components/ResponsePane/GrpcResponsePane/GrpcResponseHeaders/index.js`
+- `ResponseTrailers` → `packages/bruno-app/src/components/ResponsePane/GrpcResponsePane/ResponseTrailers/index.js`
+- `GrpcQueryResult` → `packages/bruno-app/src/components/ResponsePane/GrpcResponsePane/GrpcQueryResult/index.js`
+- `GrpcError` → `packages/bruno-app/src/components/ResponsePane/GrpcResponsePane/GrpcError/index.js`
 
 #### 3.2.3 WSResponsePane：WebSocket 专用面板
 
@@ -490,12 +536,17 @@ const WSResponsePane = ({ item, collection, response }) => {
 };
 ```
 
+**WebSocket 专用组件位置**：
+- `WSStatusCode` → `packages/bruno-app/src/components/ResponsePane/WsResponsePane/WSStatusCode/index.js`
+- `WSMessagesList` → `packages/bruno-app/src/components/ResponsePane/WsResponsePane/WSMessagesList/index.js`
+- `WSResponseHeaders` → `packages/bruno-app/src/components/ResponsePane/WsResponsePane/WSResponseHeaders/index.js`
+
 ### 3.3 错误归一化处理
 
 #### 3.3.1 HTTP/GraphQL 错误归一化
 
 ```javascript
-// 文件: packages/bruno-app/src/providers/ReduxStore/slices/collections/actions.js:613-644
+// 文件: packages/bruno-app/src/providers/ReduxStore/slices/collections/actions.js:613-645
 .catch((err) => {
   const request = itemCopy.draft?.request || itemCopy.request;
   const requestSent = request ? { url: request.url, method: request.method } : undefined;
@@ -518,26 +569,30 @@ const WSResponsePane = ({ item, collection, response }) => {
 });
 ```
 
-#### 3.3.2 统一错误展示组件
+#### 3.3.2 错误通知组件
 
 ```javascript
 // 文件: packages/bruno-app/src/components/ResponsePane/NetworkError/index.js
-const NetworkError = ({ error, onClose }) => {
-  // 无论底层协议（HTTP/gRPC/WebSocket），错误都以相同格式展示
+const NetworkError = ({ onClose }) => {
+  // Toast 通知形式展示网络错误
   return (
-    <div className="error-container">
-      <IconAlertCircle size={20} />
-      <div className="error-content">
-        <h4>{error?.userMessage || error?.message || 'Something went wrong'}</h4>
-        {error?.details && <pre className="error-details">{error.details}</pre>}
-        {error?.stack && process.env.NODE_ENV === 'development' && (
-          <details><summary>调试信息</summary><pre>{error.stack}</pre></details>
-        )}
+    <div className="max-w-md w-full bg-white shadow-lg rounded-lg pointer-events-auto flex bg-red-100">
+      <div className="flex-1 w-0 p-4">
+        <div className="flex items-start">
+          <div className="ml-3 flex-1">
+            <p className="font-medium text-red-800">Network Error</p>
+          </div>
+        </div>
+      </div>
+      <div className="flex">
+        <button onClick={onClose}>Close</button>
       </div>
     </div>
   );
 };
 ```
+
+**调用位置**：`RequestTabPanel/index.js:447` - 在 sendRequest catch 中通过 toast.custom 展示
 
 ### 3.4 事件驱动的流式响应更新
 
@@ -595,9 +650,9 @@ gRPC 和 WebSocket 采用事件驱动架构更新响应状态：
 │    ├── send-http-request (index.js:1205)                                    │  │
 │    │   └── runRequest ──► prepareRequest ──► configureRequest ──► axios    │  │
 │    ├── grpc:start-connection (grpc-event-handlers.js:155)                  │  │
-│    │   └── grpcClient.startConnection()                                     │  │
+│    │   └── prepareGrpcRequest ──► configureRequest ──► grpcClient          │  │
 │    └── renderer:ws:start-connection (ws-event-handlers.js:303)             │  │
-│        └── wsClient.startConnection()                                       │  │
+│        └── prepareWsRequest ──► wsClient.startConnection()                 │  │
 └─────────────────────────────────────────────────────────────────────────────┘
                                                                                    │
 ┌─────────────────────────────────────────────────────────────────────────────┐  │
@@ -617,9 +672,16 @@ gRPC 和 WebSocket 采用事件驱动架构更新响应状态：
 | **职责分离** | 协议分发在 Action 层，传输实现各自封装 | network/index.js 各分支 |
 | **状态归一** | 所有协议响应最终汇入同一个 responseReceived reducer | collections/index.js:527 |
 | **展示复用** | StatusCode、Timeline 等组件跨协议共享，专用面板继承扩展 | ResponsePane/ 目录 |
-| **错误一致** | 所有协议错误都映射为相同结构，使用统一 NetworkError 展示 | actions.js:613-644 |
+| **错误一致** | 所有协议错误都映射为相同结构，使用统一 NetworkError toast | actions.js:613-645 |
 
-### 4.3 各协议进入统一生命周期的关键点
+### 4.3 configureRequest 实现对比
+
+| 协议 | 文件位置 | 主要职责 |
+|------|---------|---------|
+| HTTP/GraphQL | `bruno-electron/src/ipc/network/index.js:101` | 代理配置、SSL/TLS、OAuth1/OAuth2、NTLM、axios 实例配置 |
+| gRPC | `bruno-electron/src/ipc/network/prepare-grpc-request.js:32` | OAuth2 token 获取、token 放置位置（header/query） |
+
+### 4.4 各协议进入统一生命周期的关键点
 
 1. **HTTP/GraphQL**：
    - 同步请求-响应模式
