@@ -382,6 +382,76 @@ const createSequencer = () => {
 3. **断线重置**：连接关闭时调用 `seq.clean()`，重连后 seq 从 1 重新计数
 4. **非严格单调**：仅保证同一连接内事件发生时 seq 递增，但不保证绝对连续（因为 clean 可能被调用）
 
+### 5. 重连时 computeItemKey 冲突风险分析
+
+**触发条件**：
+WebSocket 连接断开后，在同一个 Request Tab 下重新建立连接时触发：
+```javascript
+// 文件: packages/bruno-requests/src/ws/ws-client.js:357
+ws.on('close', (code, reason) => {
+  seq.clean(requestId, collectionUid);  // 1. 重置计数器
+  this.#removeConnection(requestId);     // 2. 清理连接
+});
+
+// reducer 不清理旧消息 → 旧消息仍保留在 responses 数组中
+// 文件: packages/bruno-app/src/providers/ReduxStore/slices/collections/index.js:3461
+updatedResponse.responses = (currentResponse?.responses || []).concat(eventData);
+```
+
+**冲突发生过程**：
+```
+第一次连接:
+  seq=1 (open 事件)
+  seq=1 (message 事件) ← 注意：不同事件类型各自计数
+  seq=2 (message 事件)
+  seq=1 (close 事件)
+  ↓ 断线，seq.clean() 重置
+重连:
+  seq=1 (open 事件) ← 与历史 seq=1 重复
+  seq=1 (message 事件) ← 与历史 seq=1 重复
+```
+
+**当前 computeItemKey 实现**：
+```javascript
+// 文件: packages/bruno-app/src/components/ResponsePane/WsResponsePane/WSMessagesList/index.js:236
+const computeItemKey = useCallback((_, msg) => {
+  return msg.seq ?? msg.timestamp;  // 仅两层 fallback
+}, []);
+```
+
+**影响范围**：
+| 风险类型 | 影响程度 | 说明 |
+|---------|---------|------|
+| React key 重复警告 | ⚠️ 中 | 开发环境控制台出现 `Encountered two children with the same key` |
+| 消息展开状态错乱 | ⚠️ 中 | 相同 key 的消息复用导致展开/折叠状态错误（尤其是 open/close/error 等系统消息） |
+| 虚拟滚动定位异常 | ⚠️ 中 | Virtuoso 依赖稳定 key 做位置计算，可能出现跳屏或渲染空白 |
+| 数据丢失/覆盖 | ❌ 低 | 数组本身数据完整，仅 React 渲染层受影响 |
+
+**当前代码的防护点与缺口**：
+
+✅ **已有防护**：
+1. **Fallback 机制**：seq 不存在时回退到 timestamp
+2. **数组追加顺序**：即使 key 冲突，数组数据本身是完整的
+3. **React 自愈**：开发环境警告但生产环境仍能渲染（只是性能和状态问题）
+
+❌ **存在的缺口**：
+1. **无连接维度标识**：key 中没有区分不同连接生命周期的维度
+2. **旧消息不清理**：重连时不清理历史 responses，新旧消息天然混杂
+3. **不同事件类型共用计数器**：message/open/close 等事件各自 seq 都从 1 开始
+4. **timestamp 毫秒级可能冲突**：极短时间内的多个消息 timestamp 可能相同
+
+**改进建议**：
+```javascript
+// 建议的 computeItemKey 增强方案
+const computeItemKey = useCallback((index, msg) => {
+  // 方案1: 引入数组下标作为最后兜底
+  return `${msg.seq || 'N'}-${msg.timestamp || index}-${index}`;
+  
+  // 方案2: 增加 connectionId 维度（需要后端配合）
+  // return `${msg.connectionId || '0'}-${msg.seq}`;
+}, []);
+```
+
 ---
 
 ## 断线重连策略
@@ -582,6 +652,6 @@ const useWsConnectionStatus = (requestId) => {
 
 ---
 
-**文档版本**：1.1  
+**文档版本**：1.2  
 **最后更新**：2025-05-12  
 **适用版本**：Bruno v2.x+
