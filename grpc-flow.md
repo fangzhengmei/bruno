@@ -458,18 +458,28 @@ gRPC 支持四种调用模式，根据请求/响应是否流式区分：
 
 ### 4.1 事件处理机制
 
-所有调用类型共享同一套事件处理机制：
+所有调用类型共享同一套事件处理机制。**⚠️ 重要：以下所有时序描述严格基于代码证据，不做任何超出代码语义的顺序假设。**
 
 ```javascript
 const setupGrpcEventHandlers = (callback, requestId, collectionUid, rpc, onComplete) => {
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │ 【代码可证据的保证 1】：完成状态防重入保护                          │
+  // │ - completed 标志位确保只会触发一次完成动作                         │
+  // │ - status / error / end / cancel 是"竞争关系"，谁先触发谁就完成       │
+  // │ - 一旦其中任意一个触发，后续其他完成事件都会被忽略                  │
+  // └─────────────────────────────────────────────────────────────────┘
   let completed = false;
   const complete = () => {
-    if (completed) return;
+    if (completed) return;  // 直接丢弃后续完成事件
     completed = true;
     if (typeof onComplete === 'function') onComplete();
   };
 
-  // 1. 状态事件 - 调用完成时触发
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │ 【完成事件 1】：status - 调用正常/异常结束                          │
+  // │ - 触发后调用 complete() 标记完成                                   │
+  // │ - 包含响应状态码和响应 Metadata                                    │
+  // └─────────────────────────────────────────────────────────────────┘
   rpc.on('status', (status, res) => {
     const statusWithMetadata = {
       ...status,
@@ -482,7 +492,11 @@ const setupGrpcEventHandlers = (callback, requestId, collectionUid, rpc, onCompl
     complete();
   });
 
-  // 2. 错误事件 - 调用失败时触发
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │ 【完成事件 2】：error - 调用发生错误                                │
+  // │ - 触发后调用 complete() 标记完成                                   │
+  // │ - 包含错误信息和可能的 Metadata                                     │
+  // └─────────────────────────────────────────────────────────────────┘
   rpc.on('error', (error) => {
     const errorWithMetadata = {
       ...error,
@@ -492,7 +506,11 @@ const setupGrpcEventHandlers = (callback, requestId, collectionUid, rpc, onCompl
     complete();
   });
 
-  // 3. 数据事件 - 流式响应时多次触发
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │ 【数据事件】：data - 收到响应数据                                   │
+  // │ - 流式调用时可能触发 0 ~ N 次                                      │
+  // │ - ❗ 关键：不触发 complete，不影响完成状态                           │
+  // └─────────────────────────────────────────────────────────────────┘
   rpc.on('data', (res) => {
     callback('grpc:response', requestId, collectionUid, { 
       error: null, 
@@ -500,24 +518,82 @@ const setupGrpcEventHandlers = (callback, requestId, collectionUid, rpc, onCompl
     });
   });
 
-  // 4. 结束事件 - 服务端流结束时触发
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │ 【完成事件 3】：end - 服务端流结束                                  │
+  // │ - 触发后调用 complete() 标记完成                                   │
+  // │ - 仅 Server Stream / Bidi Stream 可能触发                          │
+  // └─────────────────────────────────────────────────────────────────┘
   rpc.on('end', (res) => {
     callback('grpc:server-end-stream', requestId, collectionUid, { res });
     complete();
   });
 
-  // 5. 取消事件 - 调用被取消时触发
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │ 【完成事件 4】：cancel - 调用被取消                                │
+  // │ - 触发后调用 complete() 标记完成                                   │
+  // │ - 主动取消调用时触发（如用户点击取消按钮）                          │
+  // └─────────────────────────────────────────────────────────────────┘
   rpc.on('cancel', (res) => {
     callback('grpc:server-cancel-stream', requestId, collectionUid, { res });
     complete();
   });
 
-  // 6. 元数据事件 - 收到响应头时触发（在 data 之前）
+  // ┌─────────────────────────────────────────────────────────────────┐
+  // │ 【元数据事件】：metadata - 收到响应头                              │
+  // │ - ❗ 关键：不触发 complete，不影响完成状态                           │
+  // └─────────────────────────────────────────────────────────────────┘
   rpc.on('metadata', (metadata) => {
     const processed = processGrpcMetadata(metadata.getMap());
     callback('grpc:metadata', requestId, collectionUid, { metadata: processed });
   });
 };
+```
+
+---
+
+### 4.1.1 完成条件矩阵
+
+| 事件 | 是否触发 complete | 含义 | 连接是否移除 | 适用调用类型 |
+|-----|-----------------|------|-------------|------------|
+| **status** | ✅ 是 | gRPC 调用结束（无论成功或失败，都有状态码） | ✅ 是（通过 onComplete 回调） | 所有类型 |
+| **error** | ✅ 是 | 调用发生错误（如连接失败、认证失败等） | ✅ 是 | 所有类型 |
+| **end** | ✅ 是 | 服务端流正常结束（无更多数据） | ✅ 是 | Server Stream / Bidi Stream |
+| **cancel** | ✅ 是 | 调用被主动取消 | ✅ 是 | 所有类型 |
+| **data** | ❌ 否 | 收到一条响应数据 | ❌ 否（可继续接收） | Server Stream / Bidi Stream |
+| **metadata** | ❌ 否 | 收到响应头 Metadata | ❌ 否（等待数据或结束） | 所有类型 |
+
+> **代码证据**：`onComplete` 回调实际执行 `this.#removeConnection(requestId)`，见各 `handleXxxResponse` 函数第 2 行。
+
+---
+
+### 4.1.2 可能出现的事件顺序
+
+#### 【代码可证据的保证 2】：事件类型分组
+- ✅ **完成事件组**（互斥，仅一个能触发完成）：`status` / `error` / `end` / `cancel`
+- ✅ **非完成事件组**（无互斥，可随时触发）：`data` / `metadata`
+- ✅ **非完成事件只能在完成事件触发之前或同时触发**（完成后连接可能已关闭）
+
+#### 【非保证】：以下为实际观察到的可能顺序，但代码不作保证
+> ⚠️ 以下顺序仅为经验总结，**不代表代码契约**，实际执行顺序取决于 gRPC 底层实现和网络状况
+
+| 调用类型 | 常见事件顺序 | 说明 |
+|---------|------------|------|
+| **Unary** | `metadata` → `status` | 无 data 事件，响应通过 callback 返回 |
+| **Server Stream** | `metadata` → (`data` × N) → `end` → `status` | end 先触发标记完成，status 作为流的收尾 |
+| **Client Stream** | `metadata` → `status` | 无 data 事件，响应通过 callback 返回，客户端 write 完成后调用 end() |
+| **Bidi Stream** | `metadata` → (`data` × N，可与 write 并发) → `end` → `status` | 读写完全异步 |
+
+#### 【代码证据】：为什么我们不做顺序保证？
+```javascript
+// Bruno 代码中只是单纯注册监听器，没有任何同步原语保证顺序
+rpc.on('status', handler);  // 谁先到达谁先触发
+rpc.on('error', handler);   // gRPC 库内部的事件触发顺序不暴露给 Bruno
+rpc.on('end', handler);     // 代码只保证"第一个到达的完成事件关闭连接"
+rpc.on('cancel', handler);
+// ─────────────────────────────────────────────────────────────────────
+// ❌ 代码中不存在：Promise.all / Promise.race / 队列 / 排序等控制机制
+// ❌ 代码中不存在：metadata 事件的回调中等待 data 事件的逻辑
+// ❌ 代码中不存在：end 和 status 之间的先后依赖逻辑
 ```
 
 #### Metadata 后处理
