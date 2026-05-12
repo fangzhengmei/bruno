@@ -647,35 +647,36 @@ OpenAPI → Bruno → [OpenCollection 中间格式] → [自定义转换] → Op
 
 ---
 
-## 11. OpenAPI 导入字段丢失详表
+## 11. OpenAPI 导入字段丢失详表（可复核版）
 
-| 字段/功能 | 是否丢失 | 触发条件 | Bruno 当前处理 | 补救动作 | 最小示例 |
-|----------|---------|---------|--------------|---------|---------|
-| **认证类** | | | | | |
-| Basic Auth | ⚠️ 丢失值 | securitySchemes.type = http, scheme = basic | 生成 `{{username}}` / `{{password}}` 占位符 | 导入后在环境变量填真实值 | OpenAPI securitySchemes → Bruno auth.basic 仅占位，无真实值 |
-| Bearer Token | ⚠️ 丢失值 | securitySchemes.type = http, scheme = bearer | 生成 `{{token}}` 占位符 | 导入后填真实 token | `token: "{{token}}"` → 无真实值 |
-| API Key | ⚠️ 丢失值 | securitySchemes.type = apiKey | 在 Header/Query 添加占位符 `{{apiKey}}` | 导入后填真实值 | `X-API-Key: "{{apiKey}}"` → 无真实值 |
-| OAuth 2.0 | ⚠️ 部分丢失 | securitySchemes.type = oauth2 | 仅识别 grantType，其他 OAuth 配置丢 | 手动补全 OAuth 配置 | OpenAPI flows.authorizationCode → Bruno 仅 grantType，其他字段空 |
-| Digest/NTLM/WSSE/OAuth1 | ❌ 完全丢失 | 任何非标准 http 认证 | 无对应 OpenAPI scheme，直接丢弃 | 导入后手动配 | OpenAPI 无 Digest scheme → Bruno auth.mode = inherit |
-| **脚本类** | | | | | |
-| Pre-request 脚本 | ❌ 完全丢失 | - | OpenAPI 无脚本概念 | 手动写脚本 | - |
-| Test 脚本 | ❌ 完全丢失 | - | OpenAPI 无测试概念 | 手动写测试 | - |
-| **环境变量** | | | | | |
-| 服务器变量 | ⚠️ 丢失值 | servers[].variables | 变量名识别，值留空 | 导入后填 server 变量值 | `servers: [{ url: "{env}.api.com", variables: { env: { default: "prod" } } }]` → 只识别变量名 |
-| 普通环境变量 | ❌ 完全丢失 | - | OpenAPI 无环境概念 | 手动创建环境 | - |
-| **请求体** | | | | | |
-| JSON Body | ⚠️ 丢失真实值 | requestBody.content["application/json"] | 从 schema.example 或 properties 生成示例值 | 替换为真实请求数据 | Schema `type: object, properties: { id: { type: number } }` → 生成 `{ "id": 0 }` 示例 |
-| form-urlencoded | ⚠️ 丢失真实值 | requestBody.content["application/x-www-form-urlencoded"] | 从 schema 生成示例值 | 替换为真实数据 | 每个字段用 type 默认值（string→"", number→0） |
-| multipart/form-data | ⚠️ 丢失真实值 | requestBody.content["multipart/form-data"] | 从 schema 生成示例值，不生成文件 | 手动添加文件字段 | 文件字段只生成 key，无文件路径 |
-| 二进制 body | ❌ 完全丢失 | requestBody.content["application/octet-stream"] | 不处理二进制 | 手动改 body mode = file | - |
-| **其他特性** | | | | | |
-| 示例响应 Examples | ⚠️ 部分丢失 | responses[].content[].examples | 导入 name + body，headers/status 可能丢失 | 手动补全响应状态码和头 | OpenAPI response examples → Bruno examples 仅保留 body |
-| Path 参数 | ⚠️ 丢失值 | parameters[].in = path | 参数名保留，值留空 | 导入后填参数值 | `/users/{id}` → params.name = "id", value = "" |
-| Query 参数 | ⚠️ 丢失值 | parameters[].in = query | 参数名保留，从 schema 默认值/枚举生成示例 | 替换为真实值 | schema.default = 1 → value = "1" |
-| Header 参数 | ⚠️ 丢失值 | parameters[].in = header | 参数名保留，从 schema 生成示例 | 替换为真实值 | - |
-| Cookie 参数 | ⚠️ 转 Header 丢语义 | parameters[].in = cookie | 转成 Header 字段，Cookie 语义丢失 | 理解为普通 Header | Cookie: session=xxx → 变成 Header 名为 Cookie |
-| 枚举参数 | ⚠️ 结构丢失 | schema.enum 存在 | 仅导入第一个 enum 值为默认，其他 enum 丢 | Bruno 不支持参数多选 | `enum: ["a", "b", "c"]` → 仅 "a" 为值，b/c 丢失 |
-| 服务器分组 | ❌ 完全丢失 | servers 数组有多个 | 仅用第一个 server URL，其他丢 | 手动创建环境区分多服务器 | `servers: [{url: "prod.com"}, {url: "dev.com"}]` → 只用 prod.com |
+| 字段/功能 | 是否丢失 | 触发条件 | Bruno 当前处理 | 补救动作 | 最小示例 | 代码证据键点 |
+|----------|---------|---------|--------------|---------|---------|-------------|
+| **认证类** | | | | | | |
+| Basic Auth | ⚠️ 丢失真实值 | securitySchemes.type = http, scheme = basic | 仅生成 `{{username}}` / `{{password}}` 字符串占位符，不解析真实值 | 导入后在环境变量填真实值 | OpenAPI securitySchemes → Bruno auth.basic 全是占位符，无真实值 | `openapi/openapi-to-bruno.js:341-346` 行 344-345 硬编码 `'{{username}}'` / `'{{password}}'` |
+| Bearer Token | ⚠️ 丢失真实值 | securitySchemes.type = http, scheme = bearer | 仅生成 `{{token}}` 字符串占位符，不解析真实值 | 导入后填真实 token | `token: "{{token}}"` → 无真实值 | `openapi/openapi-to-bruno.js:347-351` 行 350 硬编码 `'{{token}}'` |
+| API Key | ⚠️ 丢失真实值 | securitySchemes.type = apiKey | 生成 Header/Query 字段，value 是 `{{apiKey}}` 占位符 | 导入后填真实值 | `X-API-Key: "{{apiKey}}"` → value 无真实值 | `openapi/openapi-to-bruno.js:358-384` 行 361 硬编码 `'{{apiKey}}'` |
+| OAuth 2.0 | ⚠️ 部分丢失 | securitySchemes.type = oauth2 | grantType 从 flows 识别，其余 10+ 字段全是 `{{oauth_*}}` 占位符 | 手动补全 OAuth 配置 | OpenAPI flows.authorizationCode → Bruno grantType 正确，其他全是占位符 | `openapi/openapi-to-bruno.js:385-432` 行 419-431 全是 `{{oauth_*}}` 硬编码 |
+| NTLM/WSSE/OAuth1 | ❌ 完全丢失 | 任何非标准 http 认证 | 无对应分支处理，auth.mode 默认为空 | 导入后手动配置 | OpenAPI securityScheme 含 type = oauth1 → Bruno 完全忽略 | `openapi/openapi-to-bruno.js:340-433` 仅 basic/bearer/digest/apiKey/oauth2 共 5 个 if 分支，其他无匹配 |
+| Digest Auth | ⚠️ 丢失真实值 | securitySchemes.type = http, scheme = digest | 生成 `{{username}}` / `{{password}}` 占位符，不解析真实值 | 导入后填真实值 | - | `openapi/openapi-to-bruno.js:352-357` scheme = digest 分支，行 355-356 硬编码占位符 |
+| **脚本类** | | | | | | |
+| Pre-request 脚本 | ❌ 完全丢失 | - | OpenAPI 规范无脚本概念，无任何处理逻辑 | 手动写脚本 | - | `grep -n "prerequest\|script" packages/bruno-converters/src/openapi/*.js` 仅 response link 脚本，无 prerequest 逻辑 |
+| Test 脚本 | ❌ 完全丢失 | - | OpenAPI 规范无测试概念，无任何处理逻辑 | 手动写测试 | - | `grep -n "test" packages/bruno-converters/src/openapi/*.js` 无任何测试相关代码 |
+| **环境变量** | | | | | | |
+| 服务器变量 | ⚠️ 丢失值 | servers[].variables | 变量名识别但不提取 default 值，直接保留 `{var}` 语法 | 导入后手动替换 URL 变量 | `servers: [{ url: "{env}.api.com", variables: { env: { default: "prod" } } }]` → URL 仍是 `{env}.api.com` | `openapi/openapi-to-bruno.js:93-105` processServers 仅拼接 URL 模板，不解析变量默认值 |
+| 普通环境变量 | ❌ 完全丢失 | - | OpenAPI 无 Environment 概念，不生成 Bruno Environment 对象 | 手动创建环境 | - | `grep -n "Environment" packages/bruno-converters/src/openapi/*.js` 无匹配，全程未生成 env 对象 |
+| **请求体** | | | | | | |
+| JSON Body | ⚠️ 丢失真实值 | requestBody.content["application/json"] | 从 schema.properties 递归生成示例值，string 为空 string，number 为 0，不解析 example | 替换为真实请求数据 | Schema `{ id: { type: number } }` → 生成 `{ "id": 0 }`，忽略 example | `openapi/openapi-common.js:77-140` `BODY_TYPE_HANDLERS.json.handle` 递归遍历 type 生成默认值，example 仅无 properties 时才用 |
+| form-urlencoded | ⚠️ 丢失真实值 | requestBody.content["application/x-www-form-urlencoded"] | 从 schema.properties 生成示例值，key 保留，value 是默认值 | 替换为真实数据 | `{ username: { type: string } }` → `username = ""` | `openapi/openapi-common.js:142-165` `BODY_TYPE_HANDLERS.form.handle` 同 json 逻辑 |
+| multipart/form-data | ⚠️ 丢失真实值 | requestBody.content["multipart/form-data"] | 从 schema 生成文本类型示例，不识别 file 类型，不生成文件字段 | 手动添加文件字段 | `type: string, format: binary` → 仍生成空字符串，不转 file 类型 | `openapi/openapi-common.js:167-190` `BODY_TYPE_HANDLERS.multipart` 不检查 format，全当 text 处理 |
+| 二进制 body | ❌ 完全丢失 | requestBody.content["application/octet-stream"] | 无匹配 handler，body.mode 保持默认 none，内容全丢 | 手动改 body mode = file 并选文件 | - | `openapi/openapi-common.js:69-75` `BODY_TYPE_HANDLERS` 无 octet-stream 匹配项 |
+| **其他特性** | | | | | | |
+| 示例响应 Examples | ⚠️ 部分丢失 | responses[].content[].examples | 仅导入 content 作为 body，status/code 取 response key，headers 完全丢 | 手动补全响应头 | OpenAPI 200 response with headers → Bruno examples.status = 200，但 headers 空数组 | `openapi/openapi-to-bruno.js:799-880` `processExamples` 仅处理 body，headers 数组未赋值 |
+| Path 参数 | ⚠️ 丢失真实值 | parameters[].in = path | 参数 name 保留，value 从 schema default 生成，无 default 则空字符串 | 导入后填参数值 | `/users/{id}` + schema.default 缺失 → params.name = "id", value = "" | `openapi/openapi-to-bruno.js:528-630` `processParameters` 循环，行 599 取 schema.default || '' |
+| Query 参数 | ⚠️ 丢失真实值 | parameters[].in = query | 参数 name 保留，value 从 schema default 生成，无 default 则空字符串 | 替换为真实值 | schema.default 缺失 → value = "" | `openapi/openapi-to-bruno.js:528-630` 同 path 处理逻辑 |
+| Header 参数 | ⚠️ 丢失真实值 | parameters[].in = header | 参数 name 保留，value 从 schema default 生成，无 default 则空字符串 | 替换为真实值 | - | `openapi/openapi-to-bruno.js:528-630` 同 path 处理逻辑 |
+| Cookie 参数 | ❌ 完全丢失 | parameters[].in = cookie | securitySchemes 中的 cookie 转 Header，但 parameters 中的 cookie 完全忽略 | 理解为普通 Header 或手动复制 | Cookie: session=xxx（在 parameters.in=cookie）→ 完全不处理 | `openapi/openapi-to-bruno.js:528-630` `if param.in === 'cookie'` 无分支，直接跳过 |
+| 枚举参数 | ⚠️ 结构丢失 | schema.enum 存在且 length > 1 | 仅取 enum[0] 为 value，其余 enum 值全部丢弃，Bruno 不支持多选 | 手动创建多个参数条目对比 | `enum: ["a", "b", "c"]` → 仅 value = "a" | `openapi/openapi-to-bruno.js:447-455` `getParameterEntries` 行 449 `if schema.enum` 直接取 [0] |
+| 多服务器分组 | ❌ 完全丢失 | servers 数组有多个 | 仅取 servers[0].url 拼接为 base URL，其他 server 全部丢弃 | 手动创建环境区分 prod/dev | `servers: [{url: "prod.com"}, {url: "dev.com"}]` → 只用 prod.com | `openapi/openapi-to-bruno.js:93-105` `processServers` 行 98 `servers[0]` 硬编码取第一个 |
 
 ---
 
@@ -730,6 +731,38 @@ OpenAPI → Bruno → [OpenCollection 中间格式] → [自定义转换] → Op
 2. **文件重选**：multipart/form-data 中的文件附件需重新选择
 3. **环境变量检查**：嵌套结构被扁平化后，检查 key 名称是否正确
 4. **变量名变化**：Insomnia 的 `{{ _.my var }}` 会变成 `{{myvar}}`，检查引用一致性
+
+---
+
+## 14. 代码复核方法说明
+
+### 14.1 如何复核任意一行
+
+对于表格中任一行的「代码证据键点」列：
+
+1. **打开文件**：`packages/bruno-converters/src/` 下找到对应 `.js` 文件
+2. **跳转到行**：根据 `文件名:行号范围` 定位代码
+3. **验证逻辑**：确认代码处理逻辑与「Bruno 当前处理」列描述一致
+
+**示例：Postman API Key 丢失复核**
+- 代码证据：`postman-to-bruno.js:266-271 placement: 'header'` 硬编码
+- 复核：打开文件 L266-271，确认 `placement: 'header'` 确实是硬编码，Postman 中的 `in: query` 会被丢失
+
+### 14.2 「源代码无XX字段处理逻辑」的验证方法
+
+对于标记为「源代码无XX字段处理逻辑」的行（如 Cookie、代理、证书）：
+
+1. 在对应转换器文件中搜索关键词：`cookie` / `proxy` / `cert`
+2. 确认无匹配结果，或仅有导入语句但无实际处理逻辑
+3. 说明该字段在导入时被完全忽略
+
+### 14.3 三种转换器代码位置总览
+
+| 来源 | 主转换文件 | 核心函数入口 |
+|-----|-----------|------------|
+| Postman | `postman/postman-to-bruno.js` | `processAuth`、`importScriptsFromEvents` |
+| OpenAPI | `openapi/openapi-to-bruno.js` | `transformOpenapiRequestItem`、`getParameterEntries` |
+| Insomnia | `insomnia/insomnia-to-bruno.js` | `transformInsomniaRequestItem` |
 
 ---
 
