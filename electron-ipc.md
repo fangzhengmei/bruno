@@ -80,15 +80,16 @@ export const callIpc = (channel, ...args) => {
 
 ### 1.2 最小复核步骤
 
-任何人可通过以下 5 步独立验证上述结论（约 5 分钟）：
+任何人可通过以下 6 步独立验证上述结论（约 8 分钟）：
 
 | 步骤 | 操作 | 预期验证结果 |
 |------|------|-------------|
 | **步骤 1** | 打开 `packages/bruno-electron/src/index.js`，定位第 234-238 行 | 确认 `nodeIntegration: true` 与 `contextIsolation: true` 同时存在 |
 | **步骤 2** | 打开 `packages/bruno-electron/src/preload.js` 全文阅读 | 确认仅通过 `contextBridge.exposeInMainWorld` 暴露接口 |
 | **步骤 3** | 打开 `packages/bruno-app/src/utils/filesystem.js` | 确认所有文件操作调用 `window.ipcRenderer.invoke` |
-| **步骤 4** | 在 `packages/bruno-app` 目录搜索 `require('fs')` 或 `require('path')` | 搜索结果应为 0（渲染进程无直接 Node 模块引用） |
-| **步骤 5** | 打开 `packages/bruno-electron/package.json` 检查 `dependencies` | 确认无 `electron-updater` 依赖 |
+| **步骤 4** | 在 `packages/bruno-app/src` 目录搜索 `require('fs')` 或 `import.*from ['"]fs['"]` | 搜索结果应为 0（渲染进程无直接 fs 模块引用） |
+| **步骤 5** | 打开 `packages/bruno-app/src/utils/common/path.js` 阅读全文 | 确认 `path` 模块仅用于字符串路径运算（relative/resolve/basename），无实际 I/O 操作 |
+| **步骤 6** | 打开 `packages/bruno-electron/package.json` 检查 `dependencies` | 确认无 `electron-updater` 依赖 |
 
 ---
 
@@ -285,10 +286,10 @@ ipcRenderer.invoke('renderer:browse-files', filters, properties).then(resolve).c
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │                        渲染进程 (Renderer)                         │
-│  ┌─────────────────┐    ┌──────────────────────┐                 │
-│  │  业务逻辑代码   │ →  │ filesystem.js 封装    │                 │
-│  │  (Redux Actions)│    │  (window.ipcRenderer)│                 │
-│  └─────────────────┘    └──────────┬───────────┘                 │
+│  ┌─────────────────┐    ┌──────────────────────┐    ┌───────────┐ │
+│  │  业务逻辑代码   │ →  │ filesystem.js IPC代理│    │ path.js   │ │
+│  │  (Redux Actions)│    │  (window.ipcRenderer)│    │ (字符串处理)│ │
+│  └─────────────────┘    └──────────┬───────────┘    └───────────┘ │
 └────────────────────────────────────┼──────────────────────────────┘
                                      │ IPC.invoke(channel, args)
                                      ▼
@@ -299,6 +300,7 @@ ipcRenderer.invoke('renderer:browse-files', filters, properties).then(resolve).c
 │  │   (暂未集成)        │  │  ipc/filesystem.js    │    │  模块     ││
 │  └─────────────────┘    └──────────────────────┘    └───────────┘│
 └───────────────────────────────────────────────────────────────────┘
+📌 关键说明：path.js 仅做字符串路径运算，无实际文件系统 I/O 操作
 ```
 
 ### 2.3 Collection 文件操作通道清单（可验证）
