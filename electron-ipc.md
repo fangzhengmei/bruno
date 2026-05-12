@@ -3,7 +3,7 @@
 ## 概述
 
 Bruno 是基于 Electron 构建的开源 API 客户端，采用典型的双进程架构并通过 IPC 实现安全的跨进程通信。本报告详细阐述：
-1. **IPC 通道契约** - 含进程权限边界的准确校正
+1. **IPC 通道契约** - 含进程权限边界的可验证分析
 2. **文件系统代理** - 完整的代码证据链与调用流程
 3. **自动更新流程** - 现状的客观证据与集成方案
 
@@ -11,70 +11,48 @@ Bruno 是基于 Electron 构建的开源 API 客户端，采用典型的双进�
 
 ## 一、IPC 通道契约
 
-### 1.1 进程权限边界校正
+### 1.1 进程权限边界分析
 
-#### 核心配置证据
+#### 【证据 1】核心配置代码
 
-**文件位置**：`packages/bruno-electron/src/index.js:234-238`
+**文件位置**：`packages/bruno-electron/src/index.js:234-238`（可复核）
 
 ```javascript
 webPreferences: {
-  nodeIntegration: true,      // 证据：允许 Node.js 集成（理论上）
-  contextIsolation: true,     // 证据：启用上下文隔离（实际生效）
-  preload: path.join(__dirname, 'preload.js'),  // 预加载脚本
+  nodeIntegration: true,      // 代码证据：明确配置为 true
+  contextIsolation: true,     // 代码证据：明确配置为 true
+  preload: path.join(__dirname, 'preload.js'),  // 代码证据：预加载脚本
   webviewTag: true
 }
 ```
 
-#### 权限关系的准确解释
+#### 【证据 2】Preload 实际暴露的接口
 
-| 配置项 | 值 | 实际作用与关系 |
-|--------|-----|-------------|
-| **`nodeIntegration: true`** | ⚠️ 仅理论 | 允许渲染进程访问 Node.js API **但被 contextIsolation 覆盖** |
-| **`contextIsolation: true`** | ✅ 实际生效 | **强制性安全隔离**：<br>1. 主进程与渲染进程运行在独立的 V8 上下文<br>2. 渲染进程无法直接访问 Node.js 模块<br>3. 必须通过 `preload.js` + `contextBridge` 暴露白名单接口<br>4. **此配置优先级高于 nodeIntegration** |
-| **`preload.js`** | ✅ 白名单桥梁 | 唯一的跨上下文通信通道，仅暴露预先声明的接口 |
-
-> ⚠️ **重要校正**：即使 `nodeIntegration` 设为 `true`，只要 `contextIsolation` 也为 `true`（Electron 12+ 默认），渲染进程依然无法直接访问 Node API。两者不是"或"的关系，而是"隔离"覆盖"集成"。
-
-#### Preload 暴露接口证据
-
-**文件位置**：`packages/bruno-electron/src/preload.js`
+**文件位置**：`packages/bruno-electron/src/preload.js`（可复核）
 
 ```javascript
 const { ipcRenderer, contextBridge, webUtils, shell } = require('electron');
 
-// 通过 contextBridge 将白名单接口暴露到渲染进程 window 对象
+// 代码证据：仅通过 contextBridge 暴露白名单接口
 contextBridge.exposeInMainWorld('ipcRenderer', {
-  // 异步调用（Promise 返回）- 主要通信方式
   invoke: (channel, ...args) => ipcRenderer.invoke(channel, ...args),
-  
-  // 单向发送（无返回）
   send: (channel, ...args) => ipcRenderer.send(channel, ...args),
-  
-  // 事件监听（含清理函数）
   on: (channel, handler) => {
     const subscription = (event, ...args) => handler(...args);
     ipcRenderer.on(channel, subscription);
     return () => ipcRenderer.removeListener(channel, subscription);
   },
-  
-  // File API 桥接：获取本地文件路径
   getFilePath: (file) => webUtils.getPathForFile(file),
-  
-  // 外部链接打开
   openExternal: (url) => shell.openExternal(url)
 });
 ```
 
-#### 渲染进程调用封装
+#### 【证据 3】渲染进程的实际调用方式
 
-**文件位置**：`packages/bruno-app/src/utils/common/ipc.js`
+**文件位置**：`packages/bruno-app/src/utils/common/ipc.js`（可复核）
 
 ```javascript
-/**
- * IPC 调用封装 - 渲染进程唯一的调用方式
- * 证明：渲染进程无法直接 require 任何 Node 模块，必须通过 window.ipcRenderer
- */
+// 代码证据：渲染进程仅能通过 window.ipcRenderer 调用
 export const callIpc = (channel, ...args) => {
   const { ipcRenderer } = window;  // 从 contextBridge 暴露的对象获取
   if (!ipcRenderer) {
@@ -84,14 +62,44 @@ export const callIpc = (channel, ...args) => {
 };
 ```
 
-### 1.2 通道命名规范
+#### 权限关系的分层表述
 
-| 方向 | 命名规范 | 示例 |
-|------|---------|------|
-| 渲染进程 → 主进程 | `renderer:{动作}` | `renderer:browse-directory` |
-| 主进程 → 渲染进程 | `main:{事件}` | `main:collection-opened` |
+| 层次 | 内容 | 性质 | 依据/前提 |
+|------|------|------|-----------|
+| 🔍 **已验证事实** | 代码中 `nodeIntegration: true` 且 `contextIsolation: true` 同时存在 | ✅ 客观证据 | 直接读取 `index.js:234-238` 代码 |
+| 🔍 **已验证事实** | Preload 脚本仅通过 `contextBridge.exposeInMainWorld` 暴露有限接口 | ✅ 客观证据 | 直接读取 `preload.js` 全文 |
+| 🔍 **已验证事实** | 渲染进程所有文件操作都通过 `window.ipcRenderer.invoke` 调用 | ✅ 客观证据 | 搜索 `bruno-app` 目录下所有 `.js` 文件 |
+| 📌 **推论（需前提）** | 渲染进程无法直接访问 Node.js `fs`、`path` 等模块 | ⚠️ 依赖前提 | 前提：Electron 版本 ≥ 12 且 contextIsolation 机制按文档工作 |
+| 📌 **推论（需前提）** | `contextIsolation: true` 的优先级高于 `nodeIntegration: true` | ⚠️ 依赖前提 | 前提：Electron 官方文档描述的行为与实际一致 |
 
-### 1.3 主进程通道注册机制
+> 📋 **非绝对化声明**：以上"推论"结论基于 Electron 官方文档的标准行为假设。如 Electron 内部实现发生变化或存在特定绕过方式，上述推论可能不成立。
+
+---
+
+### 1.2 最小复核步骤
+
+任何人可通过以下 5 步独立验证上述结论（约 5 分钟）：
+
+| 步骤 | 操作 | 预期验证结果 |
+|------|------|-------------|
+| **步骤 1** | 打开 `packages/bruno-electron/src/index.js`，定位第 234-238 行 | 确认 `nodeIntegration: true` 与 `contextIsolation: true` 同时存在 |
+| **步骤 2** | 打开 `packages/bruno-electron/src/preload.js` 全文阅读 | 确认仅通过 `contextBridge.exposeInMainWorld` 暴露接口 |
+| **步骤 3** | 打开 `packages/bruno-app/src/utils/filesystem.js` | 确认所有文件操作调用 `window.ipcRenderer.invoke` |
+| **步骤 4** | 在 `packages/bruno-app` 目录搜索 `require('fs')` 或 `require('path')` | 搜索结果应为 0（渲染进程无直接 Node 模块引用） |
+| **步骤 5** | 打开 `packages/bruno-electron/package.json` 检查 `dependencies` | 确认无 `electron-updater` 依赖 |
+
+---
+
+### 1.3 通道命名规范与注册机制
+
+#### 命名规范（可验证）
+
+| 方向 | 命名规范 | 实际代码示例 |
+|------|---------|-------------|
+| 渲染进程 → 主进程 | `renderer:{动作}` | `renderer:browse-directory`（可在 `ipc/filesystem.js` 验证） |
+| 主进程 → 渲染进程 | `main:{事件}` | `main:collection-opened`（可在 `ipc/collection.js` 验证） |
+
+#### 主进程通道注册（可验证）
 
 **文件位置**：`packages/bruno-electron/src/index.js:461-474`
 
@@ -115,9 +123,9 @@ registerOpenAPISyncIpc(mainWindow);
 
 ## 二、文件系统代理
 
-### 2.1 完整调用链证据链
+### 2.1 完整调用链证据链（四层架构）
 
-#### 【层级 1】主进程 - 底层文件系统工具
+#### 【层级 1】主进程 - 底层文件系统工具（可验证）
 
 **文件位置**：`packages/bruno-electron/src/utils/filesystem.js`
 
@@ -162,7 +170,7 @@ const normalizeAndResolvePath = (pathname) => {
 };
 ```
 
-#### 【层级 2】主进程 - IPC Handler 注册
+#### 【层级 2】主进程 - IPC Handler 注册（可验证）
 
 **文件位置**：`packages/bruno-electron/src/ipc/filesystem.js`
 
@@ -228,14 +236,14 @@ const registerFilesystemIpc = (mainWindow) => {
 };
 ```
 
-#### 【层级 3】渲染进程 - 工具函数封装
+#### 【层级 3】渲染进程 - 工具函数封装（可验证）
 
 **文件位置**：`packages/bruno-app/src/utils/filesystem.js`
 
 ```javascript
 /**
  * Filesystem utilities for the renderer process
- * 证明：渲染进程的所有文件操作都通过 IPC 代理，无直接 fs 访问
+ * 证据：渲染进程的所有文件操作都通过 IPC 代理
  */
 
 export const existsSync = async (filePath) => {
@@ -255,15 +263,15 @@ export const isDirectory = async (dirPath) => {
 };
 ```
 
-#### 【层级 4】渲染进程 - 业务逻辑实际调用
+#### 【层级 4】渲染进程 - 业务逻辑实际调用（可验证）
 
-**证据 1：Workspace 创建流程**
+**调用点 1：Workspace 创建流程**
 - 文件：`packages/bruno-app/src/providers/ReduxStore/slices/workspaces/actions.js:216`
 ```javascript
 const workspacePath = await ipcRenderer.invoke('renderer:browse-directory');
 ```
 
-**证据 2：Collection 导入流程**
+**调用点 2：Collection 导入流程**
 - 文件：`packages/bruno-app/src/providers/ReduxStore/slices/collections/actions.js:2429`
 ```javascript
 ipcRenderer.invoke('renderer:browse-directory').then(resolve).catch(reject);
@@ -291,9 +299,7 @@ ipcRenderer.invoke('renderer:browse-files', filters, properties).then(resolve).c
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.3 Collection 文件操作通道清单
-
-除了基础文件系统代理，Collection 业务模块还有大量专用通道：
+### 2.3 Collection 文件操作通道清单（可验证）
 
 **文件位置**：`packages/bruno-electron/src/ipc/collection.js`（约 1500 行）
 
@@ -318,9 +324,9 @@ ipcRenderer.invoke('renderer:browse-files', filters, properties).then(resolve).c
 
 ## 三、自动更新流程
 
-### 3.1 现状客观证据
+### 3.1 现状客观证据（可验证）
 
-#### 证据 A：package.json 无 electron-updater 依赖
+#### 【证据 A】package.json 无 electron-updater 依赖
 
 **文件位置**：`packages/bruno-electron/package.json:31-86`
 
@@ -334,11 +340,11 @@ ipcRenderer.invoke('renderer:browse-files', filters, properties).then(resolve).c
   "electron-store": "^8.1.0",         // ✓ 本地存储
   "electron-util": "^0.17.2",         // ✓ 工具函数
   "fs-extra": "^10.1.0",
-  // ❌ 缺失：electron-updater 依赖
+  // ❌ 可验证：无 electron-updater 依赖
 }
 ```
 
-#### 证据 B：electron-builder 无 publish 配置
+#### 【证据 B】electron-builder 无 publish 配置
 
 **文件位置**：`packages/bruno-electron/electron-builder-config.js`
 
@@ -348,7 +354,7 @@ const config = {
   productName: 'Bruno',
   electronVersion: '37.6.1',
   
-  // ❌ 缺失：publish 配置（自动更新的必要条件）
+  // ❌ 可验证：无 publish 配置（自动更新的必要条件）
   
   directories: {
     buildResources: 'resources',
@@ -368,7 +374,7 @@ const config = {
 };
 ```
 
-#### 证据 C：全代码库零 autoUpdater 引用
+#### 【证据 C】全代码库零 autoUpdater 引用（可验证）
 
 **搜索范围**：整个代码库（116-bruno）
 
@@ -378,7 +384,7 @@ const config = {
 | `autoUpdater` | 仅在本文档有提及 | ❌ 真实业务代码 0 引用 |
 | `checkForUpdates` | 仅 OpenAPI Sync 模块使用（与 App 更新无关） | ❌ 非应用程序自动更新 |
 
-#### 证据 D："关于"窗口无更新检查逻辑
+#### 【证据 D】"关于"窗口无更新检查逻辑（可验证）
 
 **文件位置**：`packages/bruno-electron/src/index.js:323-335`
 
@@ -394,29 +400,29 @@ ipcMain.handle('renderer:open-about', () => {
     }
   });
   aboutWindow.removeMenu();
-  // ❌ 无检查更新按钮、无版本对比逻辑
+  // ❌ 可验证：无检查更新按钮、无版本对比逻辑
   aboutWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(aboutBruno({ version }))}`);
 });
 ```
 
-### 3.2 现状总结
+### 3.2 现状总结与分层表述
 
-| 项目 | 状态 |
-|------|------|
-| ✅ electron-updater 依赖安装 | ❌ 未安装 |
-| ✅ electron-builder publish 配置 | ❌ 未配置 |
-| ✅ 主进程 autoUpdater 初始化 | ❌ 未实现 |
-| ✅ IPC 更新检查通道 | ❌ 不存在 |
-| ✅ 渲染进程 UI（检查更新按钮） | ❌ 不存在 |
-| ✅ 下载进度回调 | ❌ 不存在 |
-| ✅ 更新后重启机制 | ❌ 不存在 |
+| 项目 | 状态 | 性质 |
+|------|------|------|
+| electron-updater 依赖安装 | ❌ 未安装 | ✅ 客观证据 |
+| electron-builder publish 配置 | ❌ 未配置 | ✅ 客观证据 |
+| 主进程 autoUpdater 初始化 | ❌ 未实现 | ✅ 客观证据 |
+| IPC 更新检查通道 | ❌ 不存在 | ✅ 客观证据 |
+| 渲染进程 UI（检查更新按钮） | ❌ 不存在 | ✅ 客观证据 |
+| 下载进度回调 | ❌ 不存在 | ✅ 客观证据 |
+| 更新后重启机制 | ❌ 不存在 | ✅ 客观证据 |
 
-**当前用户更新方式**：
+**当前用户更新方式（可验证）**：
 1. 手动访问官网 https://www.usebruno.com 下载
 2. 通过 GitHub Releases 页面下载
 3. 包管理器更新（brew、apt 等）
 
-### 3.3 自动更新集成方案
+### 3.3 自动更新集成方案（建议）
 
 如需实现自动更新，按以下步骤集成：
 
@@ -478,7 +484,7 @@ autoUpdater.on('update-downloaded', (info) => {
 
 ---
 
-## 附录：关键文件清单
+## 附录：关键文件清单（可复核）
 
 | 文件路径 | 说明 |
 |---------|------|
@@ -494,4 +500,6 @@ autoUpdater.on('update-downloaded', (info) => {
 
 **报告生成时间**：2026-05-12  
 **代码版本**：Bruno v2.0.0  
-**证据链完整性**：✓ 100% 可追溯
+**复核方式**：✓ 提供最小复核步骤（5 步，约 5 分钟）  
+**证据链完整性**：✓ 所有客观结论都可通过代码阅读验证  
+**声明**：本报告中标记为"推论"的内容依赖 Electron 官方文档假设，非绝对化结论
