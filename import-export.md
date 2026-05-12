@@ -476,6 +476,204 @@ Bruno Collection
 
 ---
 
+---
+
+## 8. Insomnia 导入映射详解
+
+### 8.1 Insomnia 版本支持
+
+| 版本 | 格式标识 | 支持情况 |
+|------|---------|----------|
+| Insomnia v4 | `_type: 'workspace'` + resources 数组 | ✅ 完整支持 |
+| Insomnia v5 | `type: 'collection.insomnia.rest/5.*'` | ✅ 完整支持 |
+
+**双版本解析策略：**
+```javascript
+// packages/bruno-converters/src/insomnia/insomnia-to-bruno.js:170-176
+const isInsomniaV5Export = (data) => {
+  // V5 format has a type property at the root level
+  if (data.type && data.type.startsWith('collection.insomnia.rest/5')) {
+    return true;
+  }
+  return false;
+};
+```
+
+### 8.2 请求核心字段映射
+
+| Insomnia 字段 | Bruno 字段 | 处理策略 |
+|--------------|-----------|----------|
+| `name` | `name` | 重复名称添加后缀 `_1, _2...` |
+| `url` | `request.url` | 变量语法规范化：`{{ _.var name }}` → `{{varname}}` |
+| `method` | `request.method` | 原样保留 |
+| `description` | `request.docs` | 描述字段 |
+| `meta.id` | `uid` | 生成新 UUID |
+
+### 8.3 Headers & Params 映射
+
+| Insomnia 字段 | Bruno 字段 | 处理策略 |
+|--------------|-----------|----------|
+| `headers[].name` | `request.headers[].name` | 原样保留 |
+| `headers[].value` | `request.headers[].value` | 变量语法规范化 |
+| `headers[].disabled` | `request.headers[].enabled` | 取反：!disabled |
+| `parameters[]` | `request.params[].type: 'query'` | Query 参数 |
+| `pathParameters[]` | `request.params[].type: 'path'` | Path 参数（强制 enabled=true） |
+
+### 8.4 认证类型映射（**仅支持 2 种**）
+
+| Insomnia 认证类型 | Bruno 认证模式 | 说明 |
+|-----------------|---------------|------|
+| `basic` | `auth.mode: 'basic'` | username/password 保留，支持变量 |
+| `bearer` | `auth.mode: 'bearer'` | token 保留，支持变量 |
+| 其他类型 | `auth.mode: 'none'` | ⚠️ **不支持，静默降级** |
+
+**⚠️ Insomnia 认证限制：**
+- ❌ 不支持 Digest、NTLM、AWS SigV4
+- ❌ 不支持 API Key（header/query 放置）
+- ❌ 不支持 OAuth 1.0 / OAuth 2.0
+- ❌ 不支持 WSSE
+- ❌ 不支持 Hawk、Akamai、Netscape 等高级认证
+
+### 8.5 请求体类型映射
+
+| Insomnia MIME Type | Bruno Body Mode | 处理策略 |
+|-------------------|-----------------|----------|
+| `application/json` | `json` | text 内容直接赋值 |
+| `application/x-www-form-urlencoded` | `formUrlEncoded` | 遍历 params 数组 |
+| `multipart/form-data` | `multipartForm` | 全部设为 `type: 'text'`，⚠️ **不支持文件** |
+| `text/plain` | `text` | 原样保留 |
+| `text/xml` / `application/xml` | `xml` | 原样保留 |
+| `application/graphql` | `graphql` | JSON 解析 query/variables |
+| 其他类型 | `none` | ⚠️ **不支持，丢弃 body** |
+
+### 8.6 环境变量特殊处理
+
+`packages/bruno-converters/src/insomnia/env-utils.js`
+
+**扁平化策略：**
+```javascript
+// Insomnia 嵌套对象结构 → Bruno 点号扁平 key
+// Insomnia: { db: { host: 'localhost', port: 5432 } }
+// Bruno: [ { name: 'db.host', value: 'localhost' }, { name: 'db.port', value: '5432' } ]
+const flatEnvData = flattenObject(env?.data || {});
+```
+
+**子环境继承策略：**
+- V4: Base env（parentId = workspaceId）+ 子 env（merge base + sub）
+- V5: Base env + subEnvironments 数组（shallow merge）
+- 每个子环境都生成独立的 Bruno Environment
+
+---
+
+## 9. 三种来源回导能力矩阵
+
+| 来源格式 | 导入支持 | 导出支持 | 回导可行性 | 边界与原因 |
+|---------|---------|---------|----------|----------|
+| **Postman** | ✅ 完整 | ✅ 完整 | **双向可行** | 有 `bruno-to-postman.js`，Postman v2.1 规范完整支持 |
+| **OpenAPI/Swagger** | ✅ 完整 | ❌ **不支持** | **单向导入** | 无 `bruno-to-openapi.js` 导出器；OpenAPI 是规范描述而非集合状态，导出需要 Schema 反向生成，技术复杂度高 |
+| **Insomnia** | ✅ 完整 | ❌ **不支持** | **单向导入** | 无 `bruno-to-insomnia.js` 导出器；Insomnia v4/v5 格式未实现反向转换 |
+
+### 9.1 Postman 双向转换闭环
+
+```
+Postman v2.1 Collection
+    ↓ postman-to-bruno.js
+Bruno Collection (JSON)
+    ↓ bruno-to-postman.js
+Postman v2.1 Collection (导出)
+```
+
+**导出保真度：** ~85%
+- ✅ 请求元信息（URL、Method、Headers、Params）
+- ✅ Body（含 form-data、x-www-form-urlencoded）
+- ✅ 认证配置（Basic/Bearer/Digest/ApiKey/OAuth1/OAuth2/AWSv4）
+- ✅ 文件夹结构 + 排序序号
+- ✅ 示例响应（Examples）
+- ⚠️ 脚本 API 调用语义不转换（仅代码文本保留）
+- ⚠️ Collection Variables 需扫描推断（值可能丢失）
+
+### 9.2 OpenAPI 单向导入边界
+
+**为何不支持导出：**
+1. **信息不对称**：OpenAPI 是 API 规范（Schema、参数定义、响应格式），Bruno 是请求集合（实际请求数据），两者语义不同
+2. **无法反向生成**：从实际请求值无法反推出 JSON Schema 定义
+3. **规范复杂度高**：OpenAPI 3.0 包含 Components、Security Schemes、Callbacks、Links 等高级概念，Bruno 不存储这些元数据
+
+**导入后可导出的替代路径：**
+```
+OpenAPI → Bruno → [OpenCollection 中间格式] → [自定义转换] → OpenAPI
+```
+
+### 9.3 Insomnia 单向导入边界
+
+**为何不支持导出：**
+1. **实现优先级低**：社区需求较少
+2. **格式差异大**：Insomnia v4 使用 resources 扁平结构 + _id 关联，v5 用嵌套 children，与 Bruno 树形结构映射成本高
+3. **认证支持不对等**：Bruno 支持的认证类型远超 Insomnia 导入支持的 2 种，导出会有信息丢失
+
+---
+
+## 10. 三种来源字段丢失对照与处理策略
+
+| 功能域 | Postman 导入 | OpenAPI 导入 | Insomnia 导入 | 通用处理策略 |
+|-------|-------------|-------------|--------------|------------|
+| **认证 (Auth)** | | | | |
+| Basic | ✅ 完整支持 | ✅ 支持（变量占位符） | ✅ 完整支持 | - |
+| Bearer | ✅ 完整支持 | ✅ 支持（变量占位符） | ✅ 完整支持 | - |
+| Digest | ✅ 完整支持 | ✅ 支持（变量占位符） | ❌ **不支持，降级 none** | 导入后手动配置 |
+| NTLM | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
+| AWS SigV4 | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
+| API Key | ✅ 支持（仅 header） | ✅ 支持（header/query） | ❌ **不支持，降级 none** | 导入后手动配置 |
+| WSSE | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
+| OAuth 1.0 | ✅ 完整支持 | ❌ OpenAPI 无此 scheme | ❌ **不支持，降级 none** | 导入后手动配置 |
+| OAuth 2.0 | ✅ 4 种授权流完整 | ✅ 支持（变量占位符） | ❌ **不支持，降级 none** | 导入后手动配置 |
+| **脚本 (Scripts)** | | | | |
+| Pre-request | ✅ 代码文本导入 | ❌ OpenAPI 无脚本概念 | ❌ **不支持** | - |
+| Post-response / Tests | ✅ 代码文本导入 | ❌ OpenAPI 无脚本概念 | ❌ **不支持** | - |
+| 脚本 API 语义 | ⚠️ 文本保留，不转换 `pm.*` → `bru.*` | - | - | 运行时可能出错，需手动修改 |
+| **环境变量** | | | | |
+| 普通变量 | ✅ 完整支持 + secret 标记 | ❌ OpenAPI 无环境概念 | ✅ 扁平化导入 | - |
+| 嵌套结构变量 | ✅ 原样保留 key | ❌ - | ⚠️ **强制扁平化，点号分隔** | 嵌套结构丢失层级 |
+| 初始值 | ✅ 导入（secret 标记清空） | ❌ - | ✅ 导入 | - |
+| **请求体 (Body)** | | | | |
+| JSON/XML/Text | ✅ 完整支持 | ⚠️ 从 Schema 生成示例值 | ✅ 完整支持 | OpenAPI 示例值可能不真实 |
+| form-urlencoded | ✅ 完整支持 | ✅ 支持 | ✅ 完整支持 | - |
+| multipart/form-data | ✅ 完整支持（文本） | ✅ 支持 | ⚠️ **仅文本，不支持文件** | 文件需重新选择 |
+| GraphQL | ✅ 完整支持 | ✅ 支持 | ✅ 完整支持 | - |
+| 二进制/文件 | ✅ 文件路径保留 | ❌ - | ❌ **不支持，丢弃** | 导入后手动添加 |
+| **其他特性** | | | | |
+| 示例响应 (Examples) | ✅ 完整导入 | ✅ 从 response examples 生成 | ❌ **不支持** | - |
+| 文件夹排序 | ✅ seq 序号 Hydrate | ✅ 按 tags/path 分组 | ✅ 按原结构 | - |
+| 变量语法 | ✅ `{{var}}` 保留 | ✅ `{{var}}` 占位符 | ⚠️ 空格/前缀清理：`{{ _.a b}}` → `{{ab}}` | 可能导致变量名变化 |
+| 重复名称处理 | ✅ 自动添加 `_1, _2...` 后缀 | ✅ 自动添加后缀 | ✅ 自动添加后缀 | - |
+| Cookie | ❌ **不支持** | ❌ OpenAPI cookie 参数 → header | ❌ **不支持** | Cookie 需手动管理 |
+| 代理配置 | ❌ **不支持** | ❌ - | ❌ - | 独立配置，不随集合导入 |
+| 证书配置 | ❌ **不支持** | ❌ - | ❌ - | 独立配置，不随集合导入 |
+
+---
+
+## 11. 导入导出最佳实践
+
+### 11.1 Postman 往返导入
+1. **导出前备份**：复杂集合建议先备份原始 Postman JSON
+2. **脚本检查**：含 `pm.*` API 调用的脚本导入后需测试运行
+3. **认证重配**：OAuth 2.0 token 等敏感信息需重新获取
+4. **变量核对**：集合级变量导出时是扫描推断，可能有遗漏
+
+### 11.2 OpenAPI 导入注意
+1. **示例优先**：优先导入带完整 examples 的 OpenAPI 文档
+2. **分组策略选择**：tags 分组适合业务，path 分组适合 RESTful API
+3. **认证占位符**：导入后所有认证字段是 `{{变量}}`，需配置环境变量
+4. **Body 真实性**：从 Schema 生成的请求体是示例值，需替换为真实数据
+
+### 11.3 Insomnia 导入注意
+1. **认证重配**：除 Basic/Bearer 外，其他认证全部丢失，需手动设置
+2. **文件重选**：multipart/form-data 中的文件附件需重新选择
+3. **环境变量检查**：嵌套结构被扁平化后，检查 key 名称是否正确
+4. **变量名变化**：Insomnia 的 `{{ _.my var }}` 会变成 `{{myvar}}`，检查引用一致性
+
+---
+
 ## 附：核心文件清单
 
 | 文件路径 | 职责 |
@@ -490,5 +688,9 @@ Bruno Collection
 | `packages/bruno-converters/src/opencollection/environment.ts` | 环境转换 |
 | `packages/bruno-converters/src/postman/postman-to-bruno.js` | Postman 导入 |
 | `packages/bruno-converters/src/postman/bruno-to-postman.js` | Postman 导出 |
-| `packages/bruno-converters/src/openapi/openapi-to-bruno.js` | OpenAPI 导入 |
+| `packages/bruno-converters/src/postman/postman-env-to-bruno-env.js` | Postman 环境导入 |
+| `packages/bruno-converters/src/openapi/openapi-to-bruno.js` | OpenAPI 3.0 导入 |
+| `packages/bruno-converters/src/openapi/swagger2-to-bruno.js` | Swagger 2.0 导入 |
+| `packages/bruno-converters/src/insomnia/insomnia-to-bruno.js` | Insomnia 导入（v4/v5） |
+| `packages/bruno-converters/src/insomnia/env-utils.js` | Insomnia 环境转换 |
 | `packages/bruno-converters/src/common/index.js` | 通用工具（UUID、schema 验证等） |
