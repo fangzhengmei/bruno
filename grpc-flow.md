@@ -13,10 +13,17 @@
   - [2.1 Metadata 数据结构](#21-metadata-数据结构)
   - [2.2 Metadata 装配流程](#22-metadata-装配流程)
   - [2.3 CallCredentials 与 Metadata 集成](#23-callcredentials-与-metadata-集成)
-- [3. 流式响应消费](#3-流式响应消费)
-  - [3.1 四种调用类型](#31-四种调用类型)
-  - [3.2 事件处理机制](#32-事件处理机制)
-  - [3.3 连接生命周期管理](#33-连接生命周期管理)
+- [3. 四种调用类型对照详解](#3-四种调用类型对照详解)
+  - [3.1 类型区分方式](#31-类型区分方式)
+  - [3.2 各类型对照总表](#32-各类型对照总表)
+  - [3.3 Unary 一元调用](#33-unary-一元调用)
+  - [3.4 Server Streaming 服务端流](#34-server-streaming-服务端流)
+  - [3.5 Client Streaming 客户端流](#35-client-streaming-客户端流)
+  - [3.6 Bidi Streaming 双向流](#36-bidi-streaming-双向流)
+  - [3.7 参数签名对比](#37-参数签名对比)
+- [4. 流式响应消费](#4-流式响应消费)
+  - [4.1 事件处理机制](#41-事件处理机制)
+  - [4.2 连接生命周期管理](#42-连接生命周期管理)
 
 ---
 
@@ -121,41 +128,20 @@ methods.forEach((method) => {
 let messages = request.body.grpc;
 messages = messages.map(({ content }) => safeJsonParse(content, 'message content'));
 
-// 2. 根据调用类型执行序列化
+// 2. 根据调用类型分发到对应处理函数
+const methodType = this.#getMethodType(method);
 switch (methodType) {
   case 'unary':
-    // Unary: 直接传递消息对象，序列化由内部自动执行
-    rpc = client.makeUnaryRequest(
-      requestPath,
-      method.requestSerialize,  // 序列化器
-      method.responseDeserialize,
-      messages[0],              // 单个消息
-      metadata,
-      callback
-    );
+    this.#handleUnaryResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid });
     break;
-  
-  case 'server-streaming':
-    // Server Streaming: 同 Unary，单个请求，多个响应
-    rpc = client.makeServerStreamRequest(
-      requestPath,
-      method.requestSerialize,
-      method.responseDeserialize,
-      message,                  // 单个请求消息
-      metadata
-    );
-    break;
-  
   case 'client-streaming':
+    this.#handleClientStreamingResponse({ client, requestId, requestPath, method, metadata, collectionUid });
+    break;
+  case 'server-streaming':
+    this.#handleServerStreamingResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid });
+    break;
   case 'bidi-streaming':
-    // Client/Bidi Streaming: 通过 write() 方法流式发送
-    rpc = client.makeBidiStreamRequest(
-      requestPath,
-      method.requestSerialize,
-      method.responseDeserialize,
-      metadata
-    );
-    // 后续通过 rpc.write(message) 发送每个消息
+    this.#handleBidiStreamingResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid });
     break;
 }
 ```
@@ -301,9 +287,9 @@ const methods = await client.listServices('*', callOptions);
 
 ---
 
-## 3. 流式响应消费
+## 3. 四种调用类型对照详解
 
-### 3.1 四种调用类型
+### 3.1 类型区分方式
 
 gRPC 支持四种调用模式，根据请求/响应是否流式区分：
 
@@ -316,16 +302,161 @@ gRPC 支持四种调用模式，根据请求/响应是否流式区分：
 }
 ```
 
-#### 各类型调用处理函数
+### 3.2 各类型对照总表
 
-| 调用类型 | 创建函数 | 消息发送方式 | 响应接收方式 |
-|---------|---------|------------|------------|
-| **Unary** | `makeUnaryRequest()` | 单次参数传入 | 回调函数接收 |
-| **Server Streaming** | `makeServerStreamRequest()` | 单次参数传入 | data 事件流式接收 |
-| **Client Streaming** | `makeClientStreamRequest()` | rpc.write() 流式发送 | 结束时回调接收 |
-| **Bidi Streaming** | `makeBidiStreamRequest()` | rpc.write() 流式发送 | data 事件流式接收 |
+| 维度 | Unary (一元调用) | Server Streaming (服务端流) | Client Streaming (客户端流) | Bidi Streaming (双向流) |
+|-----|----------------|--------------------------|----------------------------|------------------------|
+| **处理函数入口** | `#handleUnaryResponse()` | `#handleServerStreamingResponse()` | `#handleClientStreamingResponse()` | `#handleBidiStreamingResponse()` |
+| **gRPC 原生 API** | `client.makeUnaryRequest()` | `client.makeServerStreamRequest()` | `client.makeClientStreamRequest()` | `client.makeBidiStreamRequest()` |
+| **请求发送入口** | 创建时直接传入 `messages[0]` | 创建时直接传入 `messages[0]` | 创建后通过 `rpc.write()` 发送 | 创建后通过 `rpc.write()` 发送 |
+| **Payload 序列化触发点** | 创建调用时内部自动序列化 | 创建调用时内部自动序列化 | 每次 `rpc.write()` 时序列化 | 每次 `rpc.write()` 时序列化 |
+| **Metadata 传递位置** | 第 5 个参数 (message 后) | 第 5 个参数 (message 后) | 第 4 个参数 (无 message) | 第 4 个参数 (无 message) |
+| **响应回调参数** | 第 6 个参数 (有 callback) | 第 6 个参数 (有 callback) | 第 5 个参数 (有 callback) | 无 callback 参数 |
+| **响应消费方式** | callback 单次回调 | `data` 事件流式多次触发 | callback 单次回调 (end 后触发) | `data` 事件流式多次触发 |
+| **结束事件** | `status` 事件 | `end` + `status` | `status` 事件 | `end` + `status` |
+| **是否需要 `rpc.end()`** | 否 | 否 | 是 (标记发送结束) | 是 (标记发送结束) |
+| **requestStream** | `false` | `false` | `true` | `true` |
+| **responseStream** | `false` | `true` | `false` | `true` |
 
-### 3.2 事件处理机制
+---
+
+### 3.3 Unary 一元调用
+
+**定义：单次请求，单次响应
+
+```javascript
+#handleUnaryResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid }) {
+  const rpc = client.makeUnaryRequest(
+    requestPath,                // 1: 方法路径
+    method.requestSerialize, // 2: 请求序列化函数
+    method.responseDeserialize, // 3: 响应反序列化函数
+    messages[0],             // 4: 请求消息 (创建时传入，立即序列化)
+    metadata,              // 5: Metadata
+    (error, res) => {       // 6: 响应回调 (单次触发)
+      this.eventCallback('grpc:response', requestId, collectionUid, { error, res });
+    }
+  );
+  this.#addConnection(requestId, { rpc, client });
+  setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+}
+```
+
+**调用链路逐项对齐：
+- **请求发送入口**：第 4 个参数 `messages[0]`，调用创建时立即发送
+- **Payload 序列化触发点**：调用 `makeUnaryRequest` 内部自动调用 `requestSerialize`
+- **Metadata 传递位置**：第 5 个参数，在 message 之后
+- **响应消费**：第 6 个参数 callback，服务端返回响应时触发一次
+- **结束事件**：`status` 事件标记整个调用完成
+
+---
+
+### 3.4 Server Streaming 服务端流
+
+**定义：单次请求，多次响应**
+
+```javascript
+#handleServerStreamingResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid }) {
+  const message = messages[0];
+  const rpc = client.makeServerStreamRequest(
+    requestPath,                // 1: 方法路径
+    method.requestSerialize, // 2: 请求序列化函数
+    method.responseDeserialize, // 3: 响应反序列化函数
+    message,                 // 4: 请求消息 (创建时传入，立即序列化)
+    metadata,              // 5: Metadata
+    (error, res) => {       // 6: 响应回调 (流结束时触发一次)
+      this.eventCallback('grpc:response', requestId, collectionUid, { error, res });
+    }
+  );
+  this.#addConnection(requestId, { rpc, client });
+  setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+}
+```
+
+**调用链路逐项对齐：
+- **请求发送入口**：第 4 个参数 `message`，同 Unary，调用创建时立即发送
+- **Payload 序列化触发点**：调用 `makeServerStreamRequest` 内部自动序列化
+- **Metadata 传递位置**：第 5 个参数，在 message 之后
+- **响应消费**：主要通过 `data` 事件流式接收，每个响应消息触发一次；callback 在流结束时触发一次
+- **结束事件**：先触发 `end` 事件标记流结束，再触发 `status` 事件标记调用完成
+
+---
+
+### 3.5 Client Streaming 客户端流
+
+**定义：多次请求，单次响应**
+
+```javascript
+#handleClientStreamingResponse({ client, requestId, requestPath, method, metadata, collectionUid }) {
+  const rpc = client.makeClientStreamRequest(
+    requestPath,                // 1: 方法路径
+    method.requestSerialize, // 2: 请求序列化函数
+    method.responseDeserialize, // 3: 响应反序列化函数
+    metadata,              // 4: Metadata (注意：没有 message 参数！)
+    (error, res) => {       // 5: 响应回调 (服务端响应时触发一次)
+      this.eventCallback('grpc:response', requestId, collectionUid, { error, res });
+    }
+  );
+  this.#addConnection(requestId, { rpc, client });
+  setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+}
+```
+
+**调用链路逐项对齐：
+- **请求发送入口**：创建调用时**不传入消息**，仅建立连接；后续通过 `sendMessage()` → `rpc.write(message)` 逐个发送
+- **Payload 序列化触发点**：每次调用 `rpc.write()` 时，gRPC 内部自动调用 `requestSerialize` 序列化
+- **Metadata 传递位置**：第 4 个参数（注意：没有 message 参数，位置前移！）
+- **响应消费**：第 5 个参数 callback，服务端在收到所有请求后返回单次响应
+- **结束事件**：必须调用 `rpc.end()` 标记发送完成；最终通过 `status` 事件标记调用完成
+
+---
+
+### 3.6 Bidi Streaming 双向流
+
+**定义：多次请求，多次响应**
+
+```javascript
+#handleBidiStreamingResponse({ client, requestId, requestPath, method, messages, metadata, collectionUid }) {
+  const rpc = client.makeBidiStreamRequest(
+    requestPath,                // 1: 方法路径
+    method.requestSerialize, // 2: 请求序列化函数
+    method.responseDeserialize, // 3: 响应反序列化函数
+    metadata               // 4: Metadata (注意：既没有 message 参数，也没有 callback 参数！)
+  );
+  this.#addConnection(requestId, { rpc, client });
+  setupGrpcEventHandlers(this.eventCallback, requestId, collectionUid, rpc, () => this.#removeConnection(requestId));
+}
+```
+
+**调用链路逐项对齐：
+- **请求发送入口**：创建调用时**既不传入消息也不传入 callback**；后续通过 `sendMessage()` → `rpc.write(message)` 流式发送
+- **Payload 序列化触发点**：每次调用 `rpc.write()` 时自动序列化
+- **Metadata 传递位置**：第 4 个参数（无 message，无 callback）
+- **响应消费**：全部通过 `data` 事件流式接收，无 callback 参数
+- **结束事件**：必须调用 `rpc.end()` 标记发送完成；服务端流结束时先触发 `end` 事件，再触发 `status` 事件
+
+---
+
+### 3.7 参数签名对比
+
+| 参数位置 | makeUnaryRequest | makeServerStreamRequest | makeClientStreamRequest | makeBidiStreamRequest |
+|---------|----------------|------------------------|------------------------|----------------------|
+| 1 | path | path | path | path |
+| 2 | serialize | serialize | serialize | serialize |
+| 3 | deserialize | deserialize | deserialize | deserialize |
+| 4 | **message** | **message** | **metadata** | **metadata** |
+| 5 | **metadata** | **metadata** | **callback** | - |
+| 6 | **callback** | **callback** | - | - |
+
+> **参数位置关键差异：**
+> - **Unary/Server Stream**: 有 message 参数（第 4 位），metadata 在第 5 位，callback 在第 6 位
+> - **Client Stream**: 无 message 参数，metadata 前移到第 4 位，callback 在第 5 位
+> - **Bidi Stream**: 无 message 参数，无 callback 参数，metadata 在第 4 位
+
+---
+
+## 4. 流式响应消费
+
+### 4.1 事件处理机制
 
 所有调用类型共享同一套事件处理机制：
 
@@ -410,7 +541,7 @@ const processGrpcMetadata = (metadata) => {
       };
     }
     // 处理单个值
-    if (value && typeof value === 'object' && value.type === 'Buffer' && Array.isArray(value.data)) {
+    if (value && typeof v === 'object' && v.type === 'Buffer' && Array.isArray(v.data)) {
       return { name, value: Buffer.from(value.data).toString('base64') };
     }
     return { name, value: value.toString() };
@@ -418,7 +549,7 @@ const processGrpcMetadata = (metadata) => {
 };
 ```
 
-### 3.3 连接生命周期管理
+### 4.2 连接生命周期管理
 
 #### 连接池管理
 
@@ -511,7 +642,13 @@ cancel(requestId) {
    - User-Agent 需要通过 channel option 处理
    - CallCredentials 用于需要动态注入 Metadata 的场景
 
-3. **流式响应消费**
+3. **四种调用类型关键差异**
+   - Unary：单入单出，message + callback 都有
+   - Server Stream：单入多出，有 message + callback，响应走 data 事件
+   - Client Stream：多入单出，无 message 参数（靠 write 发送），有 callback
+   - Bidi Stream：多入多出，既无 message 也无 callback，全靠事件驱动
+
+4. **流式响应消费**
    - 四种调用类型使用统一事件模型
    - 通过 data 事件流式接收响应数据
    - 完善的连接生命周期管理，防止资源泄漏
