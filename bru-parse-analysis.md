@@ -337,6 +337,639 @@ const collectionSchema = Yup.object({
 
 ---
 
+---
+
+## 第四层：文件系统遍历与集合构建
+
+### 核心实现文件
+
+- `packages/bruno-cli/src/utils/collection.js` (CLI 端集合构建)
+- `packages/bruno-electron/src/utils/collection.js` (Electron 端辅助函数)
+- `packages/bruno-electron/src/ipc/collection.js` (Electron IPC 处理)
+
+### 1. 目录递归遍历与文件发现
+
+#### 文件类型识别
+
+```
+collectionRoot/
+├── bruno.json         # 集合配置文件（版本、名称等）
+├── collection.bru      # 集合根继承配置（全局 headers/vars/script/auth）
+├── environments/        # 环境变量目录
+│   └── dev.bru
+├── folder1/
+│   ├── folder.bru      # 文件夹级继承配置
+│   ├── request1.bru    # 请求文件
+│   └── subfolder/
+│       ├── folder.bru
+│       └── request2.bru
+└── request3.bru
+```
+
+#### 遍历策略 (`createCollectionJsonFromPathname`)
+
+**核心遍历逻辑（bruno-cli/src/utils/collection.js）：
+
+```javascript
+const traverse = (currentPath) => {
+  if (currentPath.includes('node_modules')) return [];
+  const currentDirItems = [];
+
+  // 1. 读取目录所有文件
+  const files = fs.readdirSync(currentPath);
+
+  for (const file of files) {
+    const filePath = path.join(currentPath, file);
+    const stats = fs.lstatSync(filePath);
+
+    if (stats.isDirectory()) {
+      // 2. 跳过特殊目录
+      if (filePath === environmentsPath || file === '.git' || file === 'node_modules') continue;
+      
+      // 3. 递归处理子目录（深度优先）
+      const folderItem = { 
+        name: file, 
+        pathname: filePath, 
+        type: 'folder', 
+        items: traverse(filePath) 
+      };
+      
+      // 4. 读取 folder.bru（如果存在）
+      const folderRoot = getFolderRoot(filePath, format);
+      if (folderRoot) {
+        folderItem.root = folderRoot;
+        folderItem.seq = folderRoot.meta?.seq;  // 文件夹排序序号
+      }
+      currentDirItems.push(folderItem);
+    } else {
+      // 5. 跳过 collection.bru 和 folder.bru，只处理请求文件 (*.bru)
+      if (file === collectionFile || file === folderFile || path.extname(filePath) !== ext) continue;
+      
+      try {
+        // 6. 解析请求文件
+        const requestItem = parseRequest(fs.readFileSync(filePath, 'utf8'), { format });
+        currentDirItems.push({ name: file, ...requestItem, pathname: filePath });
+      } catch (err) {
+        // 7. 异常处理：记录警告，跳过当前文件，继续处理其他文件
+        console.warn(chalk.yellow(`Warning: Skipping invalid file ${filePath}\nError: ${err.message}`));
+        global.brunoSkippedFiles = global.brunoSkippedFiles || [];
+        global.brunoSkippedFiles.push({ path: filePath, error: err.message });
+      }
+    }
+  }
+
+  // 8. 排序：文件夹在前，请求在后
+  const folders = sortByNameThenSequence(currentDirItems.filter((i) => i.type === 'folder'));
+  const requests = currentDirItems.filter((i) => i.type !== 'folder').sort((a, b) => a.seq - b.seq);
+  return folders.concat(requests);
+};
+```
+
+### 2. 异常文件跳过策略 (CLI 模式)
+
+#### 单文件解析失败不影响整体加载
+
+```javascript
+// 位于 bruno-cli/src/utils/collection.js
+try {
+  const requestItem = parseRequest(fs.readFileSync(filePath, 'utf8'), { format });
+  currentDirItems.push({ name: file, ...requestItem, pathname: filePath });
+} catch (err) {
+  // 解析失败：发出警告，跳过当前文件，继续处理其他文件
+  console.warn(chalk.yellow(`Warning: Skipping invalid file ${filePath}\nError: ${err.message}`));
+  // 记录跳过的文件（供后续参考）
+  global.brunoSkippedFiles = global.brunoSkippedFiles || [];
+  global.brunoSkippedFiles.push({ path: filePath, error: err.message });
+}
+```
+
+#### Meta 块快速解析（Electron 端容错路径）
+
+当完整解析失败时，使用轻量级正则表达式仅提取 meta 块用于侧边栏显示：
+
+```javascript
+const parseBruFileMeta = (data) => {
+  try {
+    const metaRegex = /meta\s*{\s*([\s\S]*?)\s*}/;
+    const match = data?.match?.(metaRegex);
+    if (match) {
+      const metaContent = match[1].trim();
+      const lines = metaContent.replace(/\r\n/g, '\n').split('\n');
+      const metaJson = {};
+      lines.forEach((line) => {
+        const [key, value] = line.split(':').map((str) => str.trim());
+        if (key && value) { metaJson[key] = isNaN(value) ? value : Number(value); }
+      });
+
+      // 转换为应用可识别的最小结构
+      let requestType = metaJson.type;
+      requestType = requestType === 'http' ? 'http-request' 
+        : requestType === 'graphql' ? 'graphql-request' 
+        : 'http-request';
+      const sequence = metaJson.seq;
+      const transformedJson = {
+        type: requestType,
+        name: metaJson.name,
+        seq: !isNaN(sequence) ? Number(sequence) : 1,
+        settings: {},
+        tags: metaJson.tags || [],
+        request: { method: '', url: '', params: [], headers: [], auth: { mode: 'none' }, body: { mode: 'none' },
+          script: {}, vars: {}, assertions: [], tests: '', docs: '' }
+      };
+      return transformedJson;  // 可用于显示树节点名称
+    }
+  } catch (err) {
+    console.error('Error reading file:', err);
+    return null;
+  }
+};
+```
+
+### 3. collection.bru 与 folder.bru 的作用
+
+#### 特殊文件结构
+
+| 文件 | 位置 | 作用 |
+|------|------|------|
+| `collection.bru` | 集合根目录 | 定义全局继承配置（Headers/Vars/Script/Auth/Tests） |
+| `folder.bru` | 子文件夹 | 定义文件夹级继承配置，覆盖父级配置 |
+
+#### collection.bru 内容结构示例
+
+```
+# collection.bru 不需要 meta.name（名称从 bruno.json 读取
+auth {
+  mode: bearer
+  token: default_token
+}
+
+headers {
+  X-App-Name: bruno
+}
+
+script:pre-request {
+  console.log("collection pre-request script");
+}
+
+vars:pre-request {
+  baseUrl: https://api.example.com
+}
+
+tests {
+  console.log("collection test script");
+}
+```
+
+#### folder.bru 内容结构示例
+
+```
+meta {
+  name: folder_name  # folder.bru 需要 name 用于显示
+  seq: 1             # 文件夹排序序号（影响同级文件夹排序）
+}
+
+auth {
+  mode: bearer
+  token: folder_token
+}
+
+headers {
+  X-Folder-Header: value
+}
+```
+
+### 4. 目录递归建树
+
+#### 构建嵌套对象树
+
+```
+文件系统路径:
+  collection/
+    bruno.json
+    collection.bru
+    folderA/
+      folder.bru
+      req1.bru
+      subfolder/
+        folder.bru
+        req2.bru
+
+转换为内部结构:
+{
+  brunoConfig: { name: "collection", version: "1", ... },
+  format: "bru",
+  root: { request: { headers, vars, script, auth, tests } },  // collection.bru 解析结果
+  pathname: "/path/to/collection",
+  items: [
+    {
+      type: "folder",
+      name: "folderA",
+      pathname: "/path/to/collection/folderA",
+      root: { request: { ...folderA 级配置 } },
+      seq: 1,
+      items: [
+        { type: "http-request", name: "req1", seq: 1, pathname: "...", request: {...} },
+        {
+          type: "folder",
+          name: "subfolder",
+          pathname: "...",
+          root: { request: { ...subfolder 级配置 } },
+          items: [ { type: "http-request", name: "req2", ... } ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 关键辅助函数
+
+```javascript
+// 扁平化所有 items（便于查找）
+const flattenItems = (items = []) => {
+  const flattenedItems = [];
+  const flatten = (itms, flattened) => {
+    each(itms, (i) => {
+      flattened.push(i);
+      if (i.items && i.items.length) flatten(i.items, flattened);
+    });
+  };
+  flatten(items, flattenedItems);
+  return flattenedItems;
+};
+
+// 获取从 collection 到 item 的路径（用于继承合并）
+const getTreePathFromCollectionToItem = (collection, _item) => {
+  let path = [];
+  let item = findItemInCollection(collection, _item.uid);
+  while (item) {
+    path.unshift(item);  // 从 request 到 collection 倒序插入
+    item = findParentItemInCollection(collection, item.uid);
+  }
+  return path;  // [collectionRoot, folderA, subfolder, request]
+};
+```
+
+### 5. seq 与名称排序算法
+
+#### `sortByNameThenSequence` 核心逻辑
+
+```javascript
+const sortByNameThenSequence = (items) => {
+  const isSeqValid = (seq) => Number.isFinite(seq) && Number.isInteger(seq) && seq > 0;
+  
+  // Step 1: 所有 items 先按名称字母序排序
+  const alphabeticallySorted = [...items].sort((a, b) => 
+    a.name && b.name && a.name.localeCompare(b.name));
+  
+  // Step 2: 分离出带/不带有效 seq 的 items
+  const withoutSeq = alphabeticallySorted.filter((f) => !isSeqValid(f['seq']));
+  const withSeq = alphabeticallySorted
+    .filter((f) => isSeqValid(f['seq']))
+    .sort((a, b) => a.seq - b.seq);  // 带 seq 的先按 seq 排序
+  
+  // Step 3: 将带 seq 的 items 插入到指定位置 (seq - 1)
+  withSeq.forEach((item) => {
+    const position = item.seq - 1;
+    const existingItem = withoutSeq[position];
+    
+    // seq 冲突处理：相同 seq 的 items 合并在一起，保持字母序
+    const hasItemWithSameSeq = Array.isArray(existingItem)
+      ? existingItem?.[0]?.seq === item.seq
+      : existingItem?.seq === item.seq;
+    
+    if (hasItemWithSameSeq) {
+      const newGroup = Array.isArray(existingItem)
+        ? [...existingItem, item]
+        : [existingItem, item];
+      withoutSeq.splice(position, 1, newGroup);
+    } else {
+      withoutSeq.splice(position, 0, item);
+    }
+  });
+  
+  return withoutSeq.flat();  // 展平嵌套数组
+};
+```
+
+#### 集合整体排序策略
+
+```javascript
+const sortCollection = (collection) => {
+  const items = collection.items || [];
+  // Step 1: 分离 folders 与 requests
+  let folderItems = filter(items, (item) => item.type === 'folder');
+  let requestItems = filter(items, (item) => item.type !== 'folder');
+  
+  // Step 2: 文件夹 按 seq+name 排序
+  folderItems = sortByNameThenSequence(folderItems);
+  
+  // Step 3: 请求 仅按 seq 排序（请求无名称排序需求）
+  requestItems = requestItems.sort((a, b) => a.seq - b.seq);
+  
+  // Step 4: 文件夹始终排在请求前面
+  collection.items = folderItems.concat(requestItems);
+  
+  // Step 5: 递归处理所有子文件夹
+  each(folderItems, (item) => sortCollection(item));
+};
+```
+
+### 6. root / request 继承合并机制
+
+#### 继承优先级（从低到高）
+
+```
+collection.bru (root)
+    ↓
+  folderA/folder.bru (root)
+    ↓
+  folderA/subfolder/folder.bru (root)
+    ↓
+  request.bru (request) —— 最高优先级，可覆盖上层
+```
+
+#### (1) Headers 合并
+
+```javascript
+const mergeHeaders = (collection, request, requestTreePath, options = {}) => {
+  const { includeDisabledHeaders = false } = options;
+  let headers = new Map();        // 启用的 headers（后入覆盖先入）
+  let disabledHeaders = new Map();  // 禁用的 headers
+  
+  // 1. collection 级别 headers（最先加入）
+  const collectionRoot = collection?.draft?.root || collection?.root || {};
+  let collectionHeaders = get(collectionRoot, 'request.headers', []);
+  collectionHeaders.forEach((header) => {
+    if (header.enabled) {
+      headers.set(header.name.toLowerCase(), header.value);
+    } else if (header.name?.length > 0) {
+      disabledHeaders.set(header.name, header.value);
+    }
+  });
+  
+  // 2. 遍历 folder 路径（从上到下，下层覆盖上层）
+  for (let i of requestTreePath) {
+    if (i.type === 'folder') {
+      const folderRoot = i?.draft || i?.root;
+      let folderHeaders = get(folderRoot, 'request.headers', []);
+      folderHeaders.forEach((header) => {
+        if (header.enabled) {
+          headers.set(header.name.toLowerCase(), header.value);
+        } else if (header.name?.length > 0) {
+          disabledHeaders.set(header.name, header.value);
+        }
+      });
+    }
+  }
+  
+  // 3. request 级别 headers（最后加入，覆盖所有上层）
+  for (let i of requestTreePath) {
+    if (i.type !== 'folder') {
+      const requestHeaders = i?.draft ? get(i, 'draft.request.headers', []) : get(i, 'request.headers', []);
+      requestHeaders.forEach((header) => {
+        if (header.enabled) {
+          headers.set(header.name.toLowerCase(), header.value);
+        } else if (header.name?.length > 0) {
+          disabledHeaders.set(header.name, header.value);
+        }
+      });
+    }
+  }
+  
+  // 返回最终合并结果
+  request.headers = [
+    ...Array.from(headers, ([name, value]) => ({ name, value, enabled: true })),
+    ...(includeDisabledHeaders ? Array.from(disabledHeaders, ([name, value]) => ({ name, value, enabled: false })) : [])
+  ];
+};
+```
+
+#### (2) Vars 合并
+
+```javascript
+const mergeVars = (collection, request, requestTreePath = []) => {
+  let reqVars = new Map();  // pre-request variables
+  
+  // collection 级别
+  const collectionRoot = collection?.draft?.root || collection?.root || {};
+  let collectionRequestVars = get(collectionRoot, 'request.vars.req', []);
+  let collectionVariables = {};
+  collectionRequestVars.forEach((_var) => {
+    if (_var.enabled) {
+      reqVars.set(_var.name, _var.value);
+      collectionVariables[_var.name] = _var.value;
+    }
+  });
+  
+  // folder 级别（从上到下）
+  let folderVariables = {};
+  let requestVariables = {};
+  for (let i of requestTreePath) {
+    if (i.type === 'folder') {
+      const folderRoot = i?.draft || i?.root;
+      let vars = get(folderRoot, 'request.vars.req', []);
+      vars.forEach((_var) => {
+        if (_var.enabled) {
+          reqVars.set(_var.name, _var.value);
+          folderVariables[_var.name] = _var.value;
+        }
+      });
+    }
+  }
+  
+  // request 级别
+  for (let i of requestTreePath) {
+    if (i.type !== 'folder') {
+      const vars = i?.draft ? get(i, 'draft.request.vars.req', []) : get(i, 'request.vars.req', []);
+      vars.forEach((_var) => {
+        if (_var.enabled) {
+          reqVars.set(_var.name, _var.value);
+          requestVariables[_var.name] = _var.value;
+        }
+      });
+    }
+  }
+  
+  // 存储层级信息（用于调试）
+  request.collectionVariables = collectionVariables;
+  request.folderVariables = folderVariables;
+  request.requestVariables = requestVariables;
+  
+  // 最终合并结果
+  if (request?.vars) {
+    request.vars.req = Array.from(reqVars, ([name, value]) => ({
+      name, value, enabled: true, type: 'request'
+    }));
+  }
+  
+  // post-response vars 同理（略）
+  let resVars = new Map();
+  // ... 处理 res vars
+};
+```
+
+#### (3) Auth 合并（最近有效原则）
+
+```javascript
+const mergeAuth = (collection, request, requestTreePath) => {
+  // Step 1: 从 collection 级别开始，作为默认
+  const collectionRoot = collection?.draft?.root || collection?.root || {};
+  let collectionAuth = get(collectionRoot, 'request.auth', { mode: 'none' });
+  let effectiveAuth = collectionAuth;
+  let lastFolderWithAuth = null;
+  
+  // Step 2: 遍历路径，找到最近的非 inherit / non none 的 auth
+  for (let i of requestTreePath) {
+    if (i.type === 'folder') {
+      const folderRoot = i?.draft || i?.root;
+      const folderAuth = get(folderRoot, 'request.auth');
+      // 只有 mode 有效且非 inherit / none 时才覆盖
+      if (folderAuth && folderAuth.mode && 
+          folderAuth.mode !== 'none' && folderAuth.mode !== 'inherit') {
+        effectiveAuth = folderAuth;
+        lastFolderWithAuth = i;
+      }
+    }
+  }
+  
+  // Step 3: request 级别为 inherit 时，使用上层计算结果
+  if (request.auth.mode === 'inherit') {
+    request.auth = effectiveAuth;
+    // OAuth2 特殊处理：标记凭证来源 folderUid
+    if (effectiveAuth.mode === 'oauth2') {
+      request.oauth2Credentials = {
+        folderUid: lastFolderWithAuth?.uid || null,
+        itemUid: null,
+        mode: request.auth.mode
+      };
+    }
+  }
+};
+```
+
+#### (4) Script 与 Tests 合并
+
+```javascript
+const mergeScripts = (collection, request, requestTreePath, scriptFlow) => {
+  const collectionRoot = collection?.draft?.root || collection?.root || {};
+  let collectionPreReqScript = get(collectionRoot, 'request.script.req', '');
+  let collectionPostResScript = get(collectionRoot, 'request.script.res', '');
+  let collectionTests = get(collectionRoot, 'request.tests', '');
+  
+  // 收集所有 folder 级别的 script
+  let combinedPreReqScript = [];
+  let combinedPostResScript = [];
+  let combinedTests = [];
+  for (let i of requestTreePath) {
+    if (i.type === 'folder') {
+      const folderRoot = i?.draft || i?.root;
+      let preReqScript = get(folderRoot, 'request.script.req', '');
+      let postResScript = get(folderRoot, 'request.script.res', '');
+      let tests = get(folderRoot, 'request.tests', '');
+      if (preReqScript?.trim()) combinedPreReqScript.push(preReqScript);
+      if (postResScript?.trim()) combinedPostResScript.push(postResScript);
+      if (tests?.trim()) combinedTests.push(tests);
+    }
+  }
+  
+  // 原始 request 级别 script（用于保留元信息）
+  const originalPreReqScript = request?.script?.req || '';
+  const originalPostResScript = request?.script?.res || '';
+  const originalTests = request?.tests || '';
+  
+  // pre-request: sequential 模式 → 从 collection 到 folder 到 request（顺序执行）
+  // pre-request: non-sequential 模式 → 相同顺序
+  const preReqScripts = [
+    collectionPreReqScript,
+    ...combinedPreReqScript,
+    originalPreReqScript
+  ];
+  
+  // post-response: sequential 模式 → collection → folder → request（自上而下）
+  // post-response: non-sequential 模式 → request → folder → collection（自下而上，反转）
+  // tests: 同 post-response 顺序
+  if (scriptFlow === 'sequential') {
+    const postResScripts = [collectionPostResScript, ...combinedPostResScript, originalPostResScript];
+    const testScripts = [collectionTests, ...combinedTests, originalTests];
+    // ... 合并
+  } else {
+    const postResScripts = [originalPostResScript, ...[...combinedPostResScript].reverse(), collectionPostResScript];
+    const testScripts = [originalTests, ...[...combinedTests].reverse(), collectionTests];
+    // ... 合并
+  }
+  
+  // 每个 script 包裹在 async IIFE 中，隔离作用域，避免变量冲突
+  const wrapScriptInClosure = (script) => {
+    if (!script?.trim()) return '';
+    return `await (async () => {\n${script}\n})();`;
+  };
+  
+  // 记录元信息（栈跟踪映射）
+  request.script.reqMetadata = {
+    requestStartLine: 9,
+    requestEndLine: 11,
+    segments: [
+      { startLine: 1, endLine: 3, source: 'collection', fileName: 'collection.bru' },
+      { startLine: 5, endLine: 7, source: 'folder', fileName: 'folderA/folder.bru' }
+    ],
+    requestScriptContent: originalPreReqScript  // 原始内容（便于比对差异）
+  };
+};
+```
+
+### 7. 完整集合构建流程图
+
+```
+文件系统目录
+     │
+     ▼
+深度优先遍历 (traverse)
+     │
+     ▼
+┌─────────────────────────────────────────────┐
+│   文件分类处理                                │
+│   ├── bruno.json → 集合配置                 │
+│   ├── collection.bru → 全局 root 配置        │
+│   ├── folder.bru → 文件夹 root 配置          │
+│   └── *.bru (≠ folder.bru) → 请求解析        │
+│                                              │
+│   解析失败降级策略：                          │
+│   CLI: 警告 + 跳过； Electron: meta 快解析   │
+└─────────────────────┬───────────────────────┘
+                      │
+                      ▼
+            构建嵌套 items 树
+                      │
+                      ▼
+┌─────────────────────────────────────────────┐
+│   排序阶段                                    │
+│   ├── folders: sortByNameThenSequence()      │
+│   │   ├── 先按名称字母序                      │
+│   │   ├── 有效 seq 的按 seq 插入位置         │
+│   │   └── seq 冲突时合并保持字母序           │
+│   ├── requests: 仅按 seq 数字排序            │
+│   └── folders 始终排在 requests 前面          │
+└─────────────────────┬───────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────┐
+│   继承合并阶段 (Runner 执行前)                │
+│   path = [collectionRoot, folderA, request]  │
+│                                              │
+│   Headers:   Map 去重，后入覆盖先入           │
+│   Vars:      Map 去重，后入覆盖先入           │
+│   Auth:      最近有效原则（跳过 inherit/none）│
+│   Script:    顺序拼接 + IIFE 隔离             │
+│   Tests:     sequential/反转 两种策略        │
+└─────────────────────┬───────────────────────┘
+                      │
+                      ▼
+            Collection 内存对象
+```
+
+---
+
 ## 完整解析流程图
 
 ```
