@@ -142,7 +142,7 @@ Secrets（敏感变量如API密钥、密码等）不存储在明文配置文件�
 ├──────────────────────────────────────────────────────────────────────────┤
 │  3. Secret 解密                                                           │
 │     └─> decryptStringSafe(secret.value)                                   │
-│         使用系统安全存储 API 解密敏感值                                    │
+│         根据算法标识选择 safeStorage 或 AES256 解密                        │
 │         位置：workspace-environments.js:75 / collection-watcher.js:123    │
 ├──────────────────────────────────────────────────────────────────────────┤
 │  4. Secret 合并到环境变量                                                  │
@@ -161,8 +161,8 @@ Secrets（敏感变量如API密钥、密码等）不存储在明文配置文件�
 ├──────────────────────────────────────────────────────────────────────────┤
 │  7. 变量插值（interpolateVars）                                           │
 │     ├─> 7.1 克隆环境变量，防止修改原对象                                   │
-│     ├─> 7.2 环境变量预解析（注意：此阶段 process.env 为空对象）            │
-│     ├─> 7.3 合并所有变量源（含真实 processEnvVars）                        │
+│     ├─> 7.2 环境变量预解析（注意：此阶段 Electron/CLI 行为有差异）        │
+│     ├─> 7.3 合并所有变量源（注入真实 processEnvVars）                      │
 │     └─> 7.4 插值 URL/Headers/Body/Auth 等所有位置                         │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -217,9 +217,157 @@ const getEnvVars = (environment = {}) => {
 
 ---
 
-## 6. 变量插值（Interpolation）核心机制
+## 6. Secret 加密机制：主路径 + Fallback
 
-### 6.1 插值语法
+### 6.1 加密算法标识
+
+加密字符串格式：`$[算法标识]:[加密内容]`
+
+| 算法标识 | 算法名称 | 说明 |
+|---------|---------|------|
+| `00` | Electron SafeStorage | 系统级安全存储（主路径） |
+| `01` | AES-256-CBC | 软件加密（Fallback 方案） |
+
+**文件位置**：`packages/bruno-electron/src/utils/encryption.js:6-7`
+
+### 6.2 加密主路径与 Fallback 选择逻辑
+
+**文件位置**：`packages/bruno-electron/src/utils/encryption.js:97-127`
+
+```javascript
+function encryptString(str, passkey = null) {
+  // 特殊场景：提供 passkey（如 cookies store）时强制使用 AES
+  if (passkey !== null && passkey !== undefined) {
+    if (typeof passkey !== 'string' || passkey.length === 0) {
+      return '';
+    }
+    try {
+      const encryptedString = aes256Encrypt(str, passkey);
+      return `$${AES256_ALGO}:${encryptedString}`;
+    } catch (err) {
+      return '';
+    }
+  }
+
+  // 主路径：优先使用系统安全存储
+  if (safeStorage && safeStorage.isEncryptionAvailable()) {
+    const encryptedString = safeStorageEncrypt(str);
+    return `$${ELECTRONSAFESTORAGE_ALGO}:${encryptedString}`;
+  }
+
+  // Fallback：系统安全存储不可用时，使用基于机器标识的 AES256
+  const encryptedString = aes256Encrypt(str);
+  return `$${AES256_ALGO}:${encryptedString}`;
+}
+```
+
+### 6.3 触发 Fallback 的条件
+
+| 场景 | 触发条件 | 使用算法 |
+|-----|---------|---------|
+| **强制 AES 场景** | 调用时传入了 `passkey` 参数（如 cookie 存储） | AES-256-CBC |
+| **主路径可用** | `safeStorage.isEncryptionAvailable() === true` | Electron SafeStorage |
+| **系统安全存储不可用** | `safeStorage` 不存在或不可用 | AES-256-CBC |
+
+### 6.4 解密算法选择逻辑
+
+**文件位置**：`packages/bruno-electron/src/utils/encryption.js:129-164`
+
+```javascript
+function decryptString(str, passkey = null) {
+  // 从加密字符串中提取算法标识
+  const algo = str.substring(1, colonIndex);
+  const encryptedString = str.substring(colonIndex + 1);
+
+  if (algo === ELECTRONSAFESTORAGE_ALGO) {
+    // 算法标识为 00：尝试用 SafeStorage 解密
+    if (safeStorage && safeStorage.isEncryptionAvailable()) {
+      return safeStorageDecrypt(encryptedString);
+    } else {
+      // ⚠️ 注意：SafeStorage 不可用时直接返回空，不回退到 AES
+      return '';
+    }
+  }
+
+  if (algo === AES256_ALGO) {
+    // 算法标识为 01：用 AES256 解密（支持新旧两种密钥派生方式）
+    return aes256Decrypt(encryptedString, passkey || null);
+  }
+}
+```
+
+### 6.5 关键设计要点
+
+1. **算法标识显式存储**：加密字符串前缀明确标识使用的算法，解密时无需猜测
+2. **SafeStorage 不回退**：如果加密时用了 SafeStorage，但解密时 SafeStorage 不可用，直接返回空（不自动回退到 AES）
+3. **AES 密钥派生**：基于机器硬件标识（machine-id）派生密钥，确保在同一台机器上可解密
+4. **双重密钥派生兼容**：AES 解密时先尝试新方法，失败后自动回退到老的密钥派生方式
+
+---
+
+## 7. Electron 与 CLI：env 预解析阶段差异对比
+
+### 7.1 差异总览
+
+| 对比项 | Electron 端 | CLI 端 | 差异说明 |
+|-------|------------|--------|---------|
+| **预解析阶段是否注入 process.env** | ❌ 空对象 | ✅ 完整注入 | 最关键差异 |
+| **注释与实现一致性** | 不一致（注释说要注入，实际没注入） | 一致 | Electron 端存在"注释-实现不一致"问题 |
+| **代码位置** | `interpolate-vars.js:30-39` | `interpolate-vars.js:28-36` | 文件名相同，路径不同 |
+
+### 7.2 Electron 端实现（预解析阶段不注入）
+
+**文件位置**：`packages/bruno-electron/src/ipc/network/interpolate-vars.js:30-39`
+
+```javascript
+// envVars can inturn have values as {{process.env.VAR_NAME}}
+// so we need to interpolate envVars first with processEnvVars
+forOwn(envVariables, (value, key) => {
+  envVariables[key] = interpolate(value, {
+    process: {
+      env: {
+        // ⚠️ Electron 端：这里是空对象！根本没有注入 processEnvVars！
+        // 注释说"需要用 processEnvVars 先插值"，但实际传入空对象
+      }
+    }
+  });
+});
+```
+
+### 7.3 CLI 端实现（预解析阶段完整注入）
+
+**文件位置**：`packages/bruno-cli/src/runner/interpolate-vars.js:28-36`
+
+```javascript
+// envVars can inturn have values as {{process.env.VAR_NAME}}
+// so we need to interpolate envVars first with processEnvVars
+forOwn(envVariables, (value, key) => {
+  envVariables[key] = interpolate(value, {
+    process: {
+      env: {
+        ...processEnvVars  // ✅ CLI 端：完整注入 processEnvVars！
+      }
+    }
+  });
+});
+```
+
+### 7.4 差异影响分析
+
+#### 场景：环境变量的值本身引用了 `{{process.env.XXX}}`
+
+| 端 | 行为 | 结果 |
+|----|-----|------|
+| **CLI 端** | 预解析阶段就能解析 env 值中的 process.env 引用 | ✅ 预期行为 |
+| **Electron 端** | 预解析阶段无法解析，直到后续 `_interpolate` 阶段才能解析 | ⚠️ 延迟解析，但最终结果一致 |
+
+**说明**：由于 Electron 端在 `_interpolate` 函数中（URL/Headers/Body 等插值时）确实注入了完整的 `processEnvVars`，因此除了环境变量值之间的嵌套引用外，最终请求中的变量插值结果是一致的。
+
+---
+
+## 8. 变量插值（Interpolation）核心机制
+
+### 8.1 插值语法
 
 使用双大括号语法：`{{variableName}}`
 
@@ -229,7 +377,7 @@ const getEnvVars = (environment = {}) => {
 - 嵌套插值：变量值中可包含其他变量引用
 - Mock 数据函数：`{{$uuid}}`, `{{$timestamp}}`, `{{$randomInt}}` 等
 
-### 6.2 插值引擎实现
+### 8.2 插值引擎实现
 
 **文件位置**：`packages/bruno-common/src/interpolate/index.ts`
 
@@ -254,36 +402,11 @@ const interpolate = (str: string, obj: Record<string, any>, options) => {
 };
 ```
 
-### 6.3 ⚠️ 重要修正：环境变量预解析的真实情况
+### 8.3 真正的 process.env 注入位置（两端一致）
 
-**之前的错误结论**：环境变量会先用 process.env 预解析
+**Electron 端位置**：`packages/bruno-electron/src/ipc/network/interpolate-vars.js:56-60`
 
-**真实代码实现**：`packages/bruno-electron/src/ipc/network/interpolate-vars.js:30-39`
-
-```javascript
-// envVars can inturn have values as {{process.env.VAR_NAME}}
-// so we need to interpolate envVars first with processEnvVars
-forOwn(envVariables, (value, key) => {
-  envVariables[key] = interpolate(value, {
-    process: {
-      env: {
-        // ⚠️ 这里是空对象！根本没有注入 processEnvVars！
-        // 注释说"需要用 processEnvVars 先插值"，但实际传入空对象
-      }
-    }
-  });
-});
-```
-
-**真实结论**：
-- 虽然代码注释说明"需要用 processEnvVars 先插值 envVars"
-- 但**预解析阶段实际上传入的是空对象**，根本没有注入真实的 process.env 值！
-- 真正的 process.env 注入只发生在后续的 `_interpolate` 函数中（第56-59行）
-- 这是一个"代码注释与实际实现不一致"的情况
-
-### 6.4 真正的 process.env 注入位置
-
-**文件位置**：`packages/bruno-electron/src/ipc/network/interpolate-vars.js:56-60`
+**CLI 端位置**：`packages/bruno-cli/src/runner/interpolate-vars.js:52-56`
 
 ```javascript
 const _interpolate = (str, { escapeJSONStrings } = {}) => {
@@ -292,7 +415,7 @@ const _interpolate = (str, { escapeJSONStrings } = {}) => {
     // ... 其他变量
     process: {
       env: {
-        ...processEnvVars  // ✅ 这里才真正注入了真实的 process.env 变量
+        ...processEnvVars  // ✅ 两端都在这里真正注入了完整的 process.env 变量
       }
     }
   };
@@ -300,7 +423,7 @@ const _interpolate = (str, { escapeJSONStrings } = {}) => {
 };
 ```
 
-### 6.5 JSON 字符串转义
+### 8.4 JSON 字符串转义
 
 当在 JSON Body 中插值时，自动对特殊字符转义：
 - `\` → `\\`
@@ -312,9 +435,9 @@ const _interpolate = (str, { escapeJSONStrings } = {}) => {
 
 ---
 
-## 7. 请求发送前的变量注入流程
+## 9. 请求发送前的变量注入流程
 
-### 7.1 完整执行时序
+### 9.1 完整执行时序
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -334,8 +457,8 @@ const _interpolate = (str, { escapeJSONStrings } = {}) => {
 │                     变量插值细节                              │
 ├─────────────────────────────────────────────────────────────┤
 │  3.1 克隆环境变量，防止修改原对象                             │
-│  3.2 环境变量预解析（⚠️ 注意：此阶段 process.env 为空对象）    │
-│  3.3 合并所有变量源（✅ 此处注入真实 processEnvVars）         │
+│  3.2 环境变量预解析（⚠️ Electron 空对象 / ✅ CLI 完整注入）  │
+│  3.3 合并所有变量源（✅ 两端都在此注入真实 processEnvVars）   │
 │  3.4 插值 URL                                               │
 │  3.5 插值 Headers（键和值都支持变量）                        │
 │  3.6 插值 Request Body                                       │
@@ -354,11 +477,11 @@ const _interpolate = (str, { escapeJSONStrings } = {}) => {
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 核心注入点代码分析
+### 9.2 核心注入点代码分析
 
 **文件位置**：`packages/bruno-electron/src/ipc/network/interpolate-vars.js`
 
-#### 7.2.1 变量合并逻辑
+#### 9.2.1 变量合并逻辑
 
 ```javascript
 const combinedVars = {
@@ -378,7 +501,7 @@ const combinedVars = {
 };
 ```
 
-#### 7.2.2 各部分插值实现
+#### 9.2.2 各部分插值实现
 
 | 插值对象 | 实现方式 | 特殊处理 | 位置 |
 |---------|---------|---------|------|
@@ -391,7 +514,7 @@ const combinedVars = {
 | **Proxy** | 协议、主机、端口、用户名、密码分别插值 | - | 第215-224行 |
 | **Auth** | 所有认证字段插值 | Basic/Digest/OAuth1/OAuth2/AWS | 第228-381行 |
 
-### 7.3 OAuth2 凭证变量注入
+### 9.3 OAuth2 凭证变量注入
 
 **特殊机制**：OAuth2 认证成功后，凭证会作为动态变量注入：
 
@@ -407,9 +530,9 @@ const combinedVars = {
 
 ---
 
-## 8. 变量作用域与生命周期
+## 10. 变量作用域与生命周期
 
-### 8.1 变量作用域层次
+### 10.1 变量作用域层次
 
 ```
 Global (跨集合)
@@ -425,7 +548,7 @@ Request (请求级)
 Runtime (运行时/脚本级) → 单次请求有效
 ```
 
-### 8.2 变量生命周期
+### 10.2 变量生命周期
 
 | 变量类型 | 生命周期 | 持久化 |
 |---------|---------|--------|
@@ -441,9 +564,9 @@ Runtime (运行时/脚本级) → 单次请求有效
 
 ---
 
-## 9. 关键设计特性
+## 11. 关键设计特性
 
-### 9.1 嵌套插值支持
+### 11.1 嵌套插值支持
 
 变量值可以包含其他变量引用，引擎会循环解析直到没有可替换的变量。
 
@@ -457,7 +580,7 @@ port = 443
 → 最终解析为：https://api.example.com:443
 ```
 
-### 9.2 循环引用防护
+### 11.2 循环引用防护
 
 使用 `visited` 集合记录已解析的变量，防止无限循环：
 
@@ -468,19 +591,19 @@ if (patternRegex.test(replacement) && !visited.has(match)) {
 }
 ```
 
-### 9.3 结果缓存优化
+### 11.3 结果缓存优化
 
 使用 `results` Map 缓存已解析的变量结果，提升重复插值的性能。
 
-### 9.4 敏感信息安全
+### 11.4 敏感信息安全
 
 1. **Secret 独立存储**：不与普通环境变量一起存储在明文中
-2. **加密落盘**：使用系统安全存储 API 加密存储
+2. **加密落盘**：优先系统安全存储，不可用时 fallback 到 AES 加密
 3. **内存保护**：插值完成后敏感信息仅在内存中短暂存在
 
 ---
 
-## 10. 结论-证据对照
+## 12. 结论-证据对照
 
 每条结论对应精确的代码位置，确保结论与实现一致：
 
@@ -489,8 +612,13 @@ if (patternRegex.test(replacement) && !visited.has(match)) {
 | **process.env 三级优先级**：Collection .env > Workspace .env > OS process.env | `packages/bruno-electron/src/store/process-env.js:19-29` | ✅ 证实 |
 | **Secret 加密存储**：使用 electron-store 独立存储，不落明文配置 | `packages/bruno-electron/src/store/env-secrets.js:24-82` | ✅ 证实 |
 | **Secret 完整链路**：读取 → 解密 → 合并 → 转换 → 插值 | `packages/bruno-electron/src/store/workspace-environments.js:70-79` | ✅ 证实 |
-| **⚠️ 重要修正**：环境变量预解析阶段 process.env 为空对象 | `packages/bruno-electron/src/ipc/network/interpolate-vars.js:30-39` | ✅ 证实（注释与实现不一致） |
-| **真正的 process.env 注入位置**：在 `_interpolate` 函数的 combinedVars 中 | `packages/bruno-electron/src/ipc/network/interpolate-vars.js:56-60` | ✅ 证实 |
+| **⚠️ Electron 端**：环境变量预解析阶段 process.env 为空对象 | `packages/bruno-electron/src/ipc/network/interpolate-vars.js:30-39` | ✅ 证实（注释与实现不一致） |
+| **✅ CLI 端**：环境变量预解析阶段完整注入 process.env | `packages/bruno-cli/src/runner/interpolate-vars.js:28-36` | ✅ 证实 |
+| **真正的 process.env 注入位置**：在 `_interpolate` 函数的 combinedVars 中（两端一致） | `packages/bruno-electron/src/ipc/network/interpolate-vars.js:56-60` / `packages/bruno-cli/src/runner/interpolate-vars.js:52-56` | ✅ 证实 |
+| **加密主路径**：优先使用 Electron SafeStorage（算法标识 00） | `packages/bruno-electron/src/utils/encryption.js:120-123` | ✅ 证实 |
+| **加密 Fallback**：SafeStorage 不可用时回退到 AES256（算法标识 01） | `packages/bruno-electron/src/utils/encryption.js:125-126` | ✅ 证实 |
+| **强制 AES 场景**：传入 passkey 参数时（如 cookies store）强制使用 AES | `packages/bruno-electron/src/utils/encryption.js:106-117` | ✅ 证实 |
+| **SafeStorage 解密不回退**：SafeStorage 不可用时直接返回空，不回退到 AES | `packages/bruno-electron/src/utils/encryption.js:152-157` | ✅ 证实 |
 | **变量优先级顺序**：prompt > runtime > oauth2 > request > folder > env > collection > global | `packages/bruno-electron/src/ipc/network/interpolate-vars.js:47-61` | ✅ 证实 |
 | **9 类变量源**：global/collection/env/folder/request/oauth2/runtime/prompt/process.env | `packages/bruno-electron/src/ipc/network/interpolate-vars.js:21-61` | ✅ 证实 |
 | **嵌套插值支持**：循环解析直到无可替换变量 | `packages/bruno-common/src/interpolate/index.ts:89-130` | ✅ 证实 |
@@ -499,32 +627,33 @@ if (patternRegex.test(replacement) && !visited.has(match)) {
 
 ---
 
-## 11. 相关文件索引
+## 13. 相关文件索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
 | 变量插值核心引擎 | `packages/bruno-common/src/interpolate/index.ts` |
-| 请求变量注入 | `packages/bruno-electron/src/ipc/network/interpolate-vars.js` |
+| Electron 端变量注入 | `packages/bruno-electron/src/ipc/network/interpolate-vars.js` |
+| CLI 端变量注入 | `packages/bruno-cli/src/runner/interpolate-vars.js` |
 | Secret 安全存储 | `packages/bruno-electron/src/store/env-secrets.js` |
 | Secret 解密合并 | `packages/bruno-electron/src/store/workspace-environments.js` |
 | process.env 变量管理 | `packages/bruno-electron/src/store/process-env.js` |
+| 加密解密工具（主路径+Fallback） | `packages/bruno-electron/src/utils/encryption.js` |
 | 环境变量格式转换 | `packages/bruno-electron/src/utils/collection.js:749-768` |
 | 变量层级合并 | `packages/bruno-electron/src/utils/collection.js:mergeVars()` |
 | 网络请求主流程 | `packages/bruno-electron/src/ipc/network/index.js` |
-| 加密解密工具 | `packages/bruno-electron/src/utils/encryption.js` |
 | 集合文件 watcher | `packages/bruno-electron/src/app/collection-watcher.js` |
-| CLI 端变量插值 | `packages/bruno-cli/src/runner/interpolate-vars.js` |
 
 ---
 
-## 12. 总结
+## 14. 总结
 
 Bruno 的环境变量与 Secret 解析机制设计特点：
 
 1. **多层级变量源**：支持 9 种不同来源的变量，覆盖各种使用场景
 2. **明确的优先级规则**：从全局到运行时，优先级清晰可预测
-3. **安全的 Secret 管理**：加密存储、隔离保存，敏感信息不落明文
+3. **安全的 Secret 管理**：主路径使用系统安全存储，不可用时 fallback 到 AES 加密，敏感信息不落明文
 4. **强大的插值引擎**：支持嵌套插值、Mock 数据、JSON 安全转义
 5. **全链路注入**：URL、Headers、Body、Auth、Proxy 等所有位置都支持变量
 6. **脚本可编程**：支持通过脚本动态设置、修改变量，灵活度极高
-7. **⚠️ 注意事项**：环境变量预解析阶段未注入真实 process.env（注释与实现不一致）
+7. **⚠️ Electron vs CLI 差异**：Electron 端环境变量预解析阶段未注入真实 process.env（注释与实现不一致），CLI 端正常注入
+8. **加密算法显式标识**：加密字符串携带算法标识，解密逻辑清晰可追溯
