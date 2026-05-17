@@ -285,7 +285,7 @@
 
 ##### Cookie 参数处理现状
 
-> **重要发现**：OpenAPI 3.x 规范支持 `in: cookie` 的参数类型，但 Bruno 的导入器**完全忽略**了这类参数。
+> **统一结论**：OpenAPI 3.x 规范支持 `in: cookie` 的参数类型，但 Bruno 的导入器**完全忽略**了这类参数，无任何警告。
 
 **代码分析**：
 - OpenAPI 3.x 参数处理分支（第 265、274、283、298、307、316 行）只处理 `query`/`querystring`、`path`、`header`
@@ -629,4 +629,4 @@ Bruno 集合
 | 通用工具 | `packages/bruno-converters/src/openapi/openapi-common.js` | `BODY_TYPE_HANDLERS`, `createBrunoExample`, `groupRequestsByTags`, `groupRequestsByPath` |
 | 环境转换 | `packages/bruno-converters/src/postman/postman-env-to-bruno-env.js` | - |
 | 脚本翻译 | `packages/bruno-converters/src/postman/postman-translations.js` | - |
-| **数据结构定义 | `packages/bruno-schema/src/collections/index.js` | `requestParamsSchema` (第 420 行), `authApiKeySchema` (第 238 行) |
+| 数据结构定义 | `packages/bruno-schema/src/collections/index.js` | `requestParamsSchema` (第 420 行), `authApiKeySchema` (第 238 行) |
