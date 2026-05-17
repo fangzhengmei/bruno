@@ -268,7 +268,6 @@
 #### Parameters 转换
 
 ```javascript
-// 参数类型: query, path, header
 // 代码位置: transformOpenapiRequestItem (line 242-327)
 
 - 支持枚举(enum)参数: 每个枚举值创建一个参数条目
@@ -276,6 +275,34 @@
 - 值优先级: example > default > enum[0] > ''
 - enabled: 必填参数或有值时为 true
 ```
+
+##### 参数位置支持情况
+
+| 规范 | 支持的 `in` 值 | 不支持的 `in` 值 |
+|-----|---------------|-----------------|
+| **OpenAPI 3.x** | `query`, `querystring`, `path`, `header` | **`cookie`** (静默丢弃) |
+| **Swagger 2.0** | `query`, `path`, `header`, `body`, `formData` | 无 (Swagger 2.0 规范不支持 cookie 参数) |
+
+##### Cookie 参数处理现状
+
+> **重要发现**：OpenAPI 3.x 规范支持 `in: cookie` 的参数类型，但 Bruno 的导入器**完全忽略**了这类参数。
+
+**代码分析**：
+- OpenAPI 3.x 参数处理分支（第 265、274、283、298、307、316 行）只处理 `query`/`querystring`、`path`、`header`
+- 没有 `else` 分支，`in: cookie` 的参数会被**静默丢弃**，无任何警告或日志
+- Swagger 2.0 规范本身不支持 cookie 参数，因此不存在此问题
+
+**Bruno 内部数据结构限制**（`bruno-schema` 第 431 行）：
+```javascript
+type: Yup.string().oneOf(['query', 'path']).required('type is required')
+```
+- Bruno 的 `params` 数组仅支持 `query` 和 `path` 两种类型
+- 即使导入器处理了 cookie 参数，schema 校验也会失败
+
+**导入影响**：
+1. **数据丢失**：所有 `in: cookie` 的参数在导入后完全消失
+2. **功能缺失**：依赖 Cookie 认证的 API 导入后无法正常使用
+3. **无提示**：用户不会收到任何关于 cookie 参数被丢弃的警告
 
 #### Request Body 转换
 
@@ -572,6 +599,8 @@ Bruno 集合
 
 ### 7.2 OpenAPI 3.x vs Swagger 2.0 差异
 
+> **重要修正**：路径变量处理在两者之间**没有差异**，最终格式均为 `:param`。
+
 | 特性 | OpenAPI 3.x | Swagger 2.0 |
 |----|-------------|-------------|
 | Server 配置 | `servers` 数组 | `host` + `basePath` + `schemes` |
@@ -580,6 +609,12 @@ Bruno 集合
 | Body 定义 | `requestBody.content` | `in: body` 参数 |
 | 媒体类型 | 完整 MIME 类型匹配 | `consumes` / `produces` |
 | OAuth2 配置 | 多 flow 支持 | 单 flow 定义 |
+| **路径变量格式** | **`:param`** | **`:param`** |
+
+**路径变量处理说明**：
+- **两者相同**：`{param}` → `:param`，使用正则 `/{([^}]+)}/g`
+- **OpenAPI 3.x 存在无效代码**：`transformOpenapiRequestItem` 第 191 行的二次替换逻辑由于前置步骤已完成替换，永远不会执行
+- **正则差异**：虽然 OpenAPI 3.x 的二次替换正则 `/{([a-zA-Z]+)}/g` 有严格限制，但该限制在实际流程中不生效
 
 ---
 
