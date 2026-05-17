@@ -216,15 +216,54 @@
 
 #### 路径参数处理
 
-```javascript
-// OpenAPI 3.x (line 191)
-- {param} 替换为 {{operationId_param}} 格式
-- 例如 /users/{id} -> /users/{{getUserById_id}}
+> **重要修正**：经过代码核对，OpenAPI 3.x 和 Swagger 2.0 的路径变量最终转换结果完全相同，均为 `:param` 格式。
 
-// Swagger 2.0 (line 151)
+```javascript
+// ========== Swagger 2.0 实际处理 ==========
+// 代码位置: parseSwagger2Collection (line 593)
+- 使用正则: /{([^}]+)}/g
 - {param} 替换为 :param 格式
 - 例如 /users/{id} -> /users/:id
+- 在 transformSwaggerRequestItem 之前完成，路径无二次处理
+
+// ========== OpenAPI 3.x 实际处理 ==========
+// 代码位置: parseOpenApiCollection (line 863)
+// 第一步: 所有 {param} 先被替换为 :param
+- 使用正则: /{([^}]+)}/g
+- 例如 /users/{id} -> /users/:id
+
+// 代码位置: transformOpenapiRequestItem (line 191)
+// 第二步: 尝试二次替换（但实际上永远不会匹配！）
+- 使用正则: /{([a-zA-Z]+)}/g
+- 由于第一步已将 {param} 替换为 :param
+- 此正则永远无法匹配任何内容，路径保持 :param 格式不变
+
+// 结论: OpenAPI 3.x 的路径变量最终也是 :param 格式
+// transformOpenapiRequestItem 第191行的代码是一个无效的 Bug
 ```
+
+##### OpenAPI 正则匹配范围的限制与影响
+
+| 正则表达式 | 匹配范围 | 实际效果 |
+|-----------|---------|---------|
+| `/{([a-zA-Z]+)}/g` | **仅纯字母** | 不匹配下划线、数字、特殊字符 |
+
+**匹配测试结果**：
+
+| 路径示例 | 是否匹配 | 备注 |
+|---------|---------|------|
+| `/users/{id}` | ✓ | 纯字母 |
+| `/users/{userId}` | ✓ | 纯字母（驼峰） |
+| `/users/{user_id}` | ✗ | 包含下划线 |
+| `/users/{user123}` | ✗ | 包含数字 |
+| `/api/{v1}/users` | ✗ | 包含数字 |
+| `/{tenant_id}/{id}` | 仅匹配 {id} | 仅第二个参数匹配 |
+
+**实际影响**：
+
+1. **二次替换逻辑永远不会执行**：由于第一步已将 `{param}` 替换为 `:param`，该正则无任何可匹配的内容
+2. **变量名限制不生效**：该正则的严格匹配限制在实际流程中不会产生任何效果
+3. **最终结果一致**：OpenAPI 3.x 和 Swagger 2.0 的路径变量最终都呈现为 `:param` 格式
 
 #### Parameters 转换
 
