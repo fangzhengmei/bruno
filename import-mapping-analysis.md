@@ -605,7 +605,8 @@ Bruno 集合
 |----|-------------|-------------|
 | Server 配置 | `servers` 数组 | `host` + `basePath` + `schemes` |
 | 安全配置 | `components.securitySchemes` | `securityDefinitions` |
-| 参数位置 | 支持 cookie | 不支持 cookie |
+| **参数 Cookie 支持** | 规范支持，导入器不支持 | 规范不支持 |
+| **鉴权 Cookie 支持** | 规范支持，导入器部分支持（有 Bug） | 规范不支持 |
 | Body 定义 | `requestBody.content` | `in: body` 参数 |
 | 媒体类型 | 完整 MIME 类型匹配 | `consumes` / `produces` |
 | OAuth2 配置 | 多 flow 支持 | 单 flow 定义 |
@@ -620,11 +621,12 @@ Bruno 集合
 
 ## 八、代码文件索引
 
-| 功能 | 文件路径 | 核心函数 |
-|-----|---------|---------|
+| 功能 | 文件路径 | 核心函数 / 关键位置 |
+|-----|---------|-------------------|
 | Postman 转换 | `packages/bruno-converters/src/postman/postman-to-bruno.js` | `postmanToBruno`, `processAuth`, `importScriptsFromEvents` |
 | OpenAPI 3.x 转换 | `packages/bruno-converters/src/openapi/openapi-to-bruno.js` | `openApiToBruno`, `parseOpenApiCollection`, `transformOpenapiRequestItem` |
 | Swagger 2.0 转换 | `packages/bruno-converters/src/openapi/swagger2-to-bruno.js` | `swagger2ToBruno`, `parseSwagger2Collection`, `transformSwaggerRequestItem` |
 | 通用工具 | `packages/bruno-converters/src/openapi/openapi-common.js` | `BODY_TYPE_HANDLERS`, `createBrunoExample`, `groupRequestsByTags`, `groupRequestsByPath` |
 | 环境转换 | `packages/bruno-converters/src/postman/postman-env-to-bruno-env.js` | - |
 | 脚本翻译 | `packages/bruno-converters/src/postman/postman-translations.js` | - |
+| **数据结构定义 | `packages/bruno-schema/src/collections/index.js` | `requestParamsSchema` (第 420 行), `authApiKeySchema` (第 238 行) |
