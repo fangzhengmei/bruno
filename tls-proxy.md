@@ -572,17 +572,59 @@ if (accessTokenUrl && grantType !== 'implicit') {
 
 ## 八、重定向时的配置重新评估
 
-当请求发生重定向时，会对新 URL 重新评估代理和证书配置：
+### 8.1 核心机制：闭包捕获
+
+理解重定向行为的关键在于 `makeAxiosInstance()` 的参数捕获机制：
 
 ```javascript
-// axios-instance.js:419-428
+// axios-instance.js:74-82
+function makeAxiosInstance({
+  proxyMode = 'off',
+  proxyConfig = {},
+  httpsAgentRequestFields = {},  // 这个参数被闭包捕获
+  // ...
+} = {}) {
+  const instance = axios.create({...});
+  
+  // 响应拦截器在闭包中捕获上述参数
+  instance.interceptors.response.use(
+    (response) => { /* ... */ },
+    async (error) => {
+      if (isRedirect(error)) {
+        // ⚠️  这里使用的是闭包捕获的 httpsAgentRequestFields
+        // 不会重新调用 getCertsAndProxyConfig()
+        await setupProxyAgents({
+          requestConfig,
+          proxyMode,               // 闭包捕获 - 不变
+          proxyConfig,             // 闭包捕获 - 不变
+          httpsAgentRequestFields, // 闭包捕获 - 不变！
+          // ...
+        });
+      }
+    }
+  );
+}
+```
+
+`httpsAgentRequestFields` 在 axios 实例创建时就已确定，包含：
+- `ca` - CA 证书链
+- `cert`, `key` / `pfx` - **已根据原始请求 URL 匹配的客户端证书**
+- `passphrase` - 证书密码
+- `rejectUnauthorized` - TLS 验证开关
+
+这些值在实例生命周期内**保持不变**，重定向时不会重新计算。
+
+### 8.2 重定向调用链路
+
+```javascript
+// axios-instance.js:419-428（Electron 端）
 try {
   await setupProxyAgents({
-    requestConfig,  // 包含重定向后的 URL
-    proxyMode,
-    proxyConfig,
-    httpsAgentRequestFields,
-    interpolationOptions,
+    requestConfig,        // ✅ 包含重定向后的 URL
+    proxyMode,            // ❌ 闭包捕获 - 沿用原始值
+    proxyConfig,          // ❌ 闭包捕获 - 沿用原始值
+    httpsAgentRequestFields,  // ❌ 闭包捕获 - 沿用原始值（含原始 URL 匹配的证书）
+    interpolationOptions, // ❌ 闭包捕获 - 沿用原始值
     timeline
   });
 } catch (err) {
@@ -590,15 +632,116 @@ try {
 }
 ```
 
-**重新评估的内容**：
-1. **代理绕过**：新 URL 是否匹配 `no_proxy` 或 `bypassProxy` 规则
-2. **客户端证书**：新 URL 的域名是否匹配其他客户端证书配置
-3. **PAC 解析**：如果使用 PAC，会用新 URL 重新执行 PAC 脚本
+CLI 端行为完全一致（`bruno-cli/src/utils/axios-instance.js:182-190`）。
 
-**保持不变的内容**：
-- CA 证书配置
-- TLS 验证设置（`rejectUnauthorized`）
-- 代理配置本身（`proxyMode`、`proxyConfig`）
+### 8.3 什么会重建，什么会沿用
+
+| 配置项 | 重定向时是否重新评估 | 说明 |
+|--------|---------------------|------|
+| **客户端证书** (cert/key/pfx/passphrase) | ❌ **沿用原始匹配** | 最关键的一点！`httpsAgentRequestFields` 是闭包捕获的，包含原始 URL 匹配的证书。`setupProxyAgents()` 内部**不会**重新调用 `getCertsAndProxyConfig()` 进行域名匹配。 |
+| **CA 证书链** (ca) | ❌ 沿用 | 同上，在 `httpsAgentRequestFields` 中 |
+| **TLS 验证开关** (rejectUnauthorized) | ❌ 沿用 | 同上 |
+| **代理模式** (proxyMode) | ❌ 沿用 | 闭包捕获 |
+| **代理配置** (proxyConfig) | ❌ 沿用 | 闭包捕获 |
+| **代理绕过规则** | ✅ 重新评估 | `setupProxyAgents()` 中调用 `shouldUseProxy(requestConfig.url, ...)`，使用**新 URL** 评估 |
+| **PAC 解析** | ✅ 重新执行 | `setupProxyAgents()` 中调用 `resolver.resolve(requestConfig.url)`，使用**新 URL** 执行 PAC 脚本 |
+| **Agent 实例** | ✅ 重新创建 | `setupProxyAgents()` 首先执行 `delete requestConfig.httpAgent/httpsAgent` 清除旧 Agent，然后创建新的 |
+| **Cookie** | ✅ 重新获取 | 调用 `getCookieStringForUrl(redirectUrl)`，使用**新 URL** |
+
+### 8.4 跨域重定向的影响
+
+**⚠️ 重要限制**：跨域重定向时，客户端证书不会自动切换。
+
+**问题场景**：
+```
+原始请求：https://api.example.com/auth  → 匹配客户端证书 A
+重定向到：https://api.another-domain.com/data  → 仍然使用证书 A（而不是匹配 another-domain 的证书 B）
+```
+
+**可能导致的问题**：
+
+1. **证书不匹配错误**：如果重定向后的目标域名需要不同的客户端证书，会收到 401 未授权或证书验证失败
+2. **证书泄漏风险**：将为源域名准备的客户端证书发送给了目标域名，可能违反安全策略
+3. **认证失败**：如果目标域名不需要客户端证书但源域名需要，可能导致不必要的证书交换
+4. **无证书失败**：如果源域名未配置客户端证书但目标域名需要，重定向后仍然没有证书
+
+**代码证据**：
+```javascript
+// setupProxyAgents 中没有客户端证书重新匹配逻辑
+// proxy-util.js:107-264
+async function setupProxyAgents({ httpsAgentRequestFields, ... }) {
+  // 直接使用传入的 httpsAgentRequestFields 创建 Agent
+  const tlsOptions = { ...httpsAgentRequestFields, ... };
+  
+  // 仅根据 URL 判断协议类型，不重新匹配客户端证书
+  const isHttpsRequest = parsedUrl.protocol === 'https:';
+  
+  // 创建 Agent 时直接传入 tlsOptions
+  requestConfig.httpsAgent = getOrCreateHttpsAgent({ 
+    AgentClass: PatchedHttpsProxyAgent, 
+    options: tlsOptions,  // 包含原始 URL 匹配的证书
+    // ...
+  });
+}
+```
+
+**注意**：CA 证书配置不受跨域影响，因为 CA 证书是合并后的证书链，用于验证所有服务器证书。
+
+### 8.5 排障建议
+
+#### 问题 1：跨域重定向后客户端认证失败
+
+**现象**：直接请求 `https://B.com` 正常，但从 `https://A.com` 重定向到 `https://B.com` 时返回 401 或证书错误。
+
+**排查步骤**：
+1. 查看请求 timeline，确认使用的客户端证书
+2. 检查 `httpsAgentRequestFields` 中是否包含 `cert`/`key`/`pfx` 字段
+3. 确认证书是否是为原始域名（A.com）匹配的，而不是目标域名（B.com）
+4. 检查 `bruno.json` 中客户端证书的域名配置
+
+**解决方案**：
+- **方案 A**：避免跨域重定向，直接请求最终目标 URL
+- **方案 B**：配置更宽泛的客户端证书域名匹配（如 `*.example.com` 覆盖所有子域名）
+- **方案 C**：在前置脚本中检测重定向并手动发起新请求（新请求会重新匹配证书）
+
+#### 问题 2：代理绕过规则在重定向后不生效
+
+**现象**：设置了 `no_proxy=internal.com`，但重定向到 `http://internal.com/api` 时仍然走了代理。
+
+**排查步骤**：
+1. 检查 timeline 中的代理模式日志
+2. 确认重定向后的 URL 是否正确解析
+3. 检查 `bypassProxy` 配置是否正确
+
+**注意**：代理绕过规则**会**针对重定向后的 URL 重新评估，如果不生效可能是规则匹配问题。
+
+#### 问题 3：PAC 重定向后选择了错误的代理
+
+**现象**：PAC 脚本针对不同域名返回不同代理，但重定向后代理选择不正确。
+
+**排查步骤**：
+1. 查看 timeline 中的 PAC 解析日志（`PAC directives: ...`）
+2. 确认 PAC 脚本是否正确处理了重定向后的 URL
+3. 检查 PAC 脚本是否有缓存问题
+
+**注意**：PAC 解析**会**针对重定向后的 URL 重新执行。
+
+#### 问题 4：重定向后 TLS 验证行为异常
+
+**现象**：关闭了 TLS 验证，但重定向后仍然提示证书错误。
+
+**排查步骤**：
+1. 确认 `shouldVerifyTls` 偏好设置是否关闭
+2. 检查 `httpsAgentRequestFields.rejectUnauthorized` 是否为 `false`
+3. 注意：TLS 验证设置**不会**因重定向而改变
+
+#### 通用排障技巧
+
+1. **启用 timeline 查看**：每个请求的 timeline 会记录代理模式、PAC 解析结果、证书使用情况
+2. **检查代理模式日志**：timeline 中会有 `Proxy mode: on | system | pac | off` 条目
+3. **确认请求 URL**：检查 timeline 中的 `Preparing request to {url}` 确认实际请求的 URL
+4. **对比直接请求**：尝试直接请求重定向后的 URL，对比行为差异
+5. **查看 Node.js 调试日志**：设置 `DEBUG=*` 查看底层 TLS 握手日志
 
 ---
 
@@ -623,11 +766,12 @@ try {
 
 ### 10.1 核心设计原则
 
-1. **集中配置，分散执行**：`getCertsAndProxyConfig()` 统一聚合配置，实际 Agent 创建在请求拦截器中执行
+1. **集中配置，分散执行**：`getCertsAndProxyConfig()` 在请求准备阶段统一聚合配置，实际 Agent 创建在请求拦截器中执行
 2. **层级覆盖**：集合级配置 > 应用级配置 > 系统级配置
-3. **URL 感知**：客户端证书匹配、代理绕过、PAC 解析都针对具体 URL 评估
-4. **重定向安全**：重定向时重新评估 URL 相关配置，避免配置错配
-5. **变量插值**：所有配置字段支持环境变量插值，增强灵活性
+3. **URL 感知（部分）**：代理绕过、PAC 解析、Cookie 获取针对具体 URL 评估；**但客户端证书匹配仅在初始请求时评估一次**
+4. **闭包捕获机制**：`makeAxiosInstance()` 创建时捕获的配置在实例生命周期内保持不变，重定向时不重新计算
+5. **重定向部分重评估**：重定向时仅重新评估 URL 相关的代理规则，证书配置保持不变
+6. **变量插值**：所有配置字段支持环境变量插值，增强灵活性
 
 ### 10.2 优先级总览
 
@@ -640,9 +784,14 @@ try {
 
 客户端证书优先级：
   按配置顺序，第一个域名匹配者生效
+  ⚠️  仅在初始请求时匹配一次，重定向时不重新匹配
 
 TLS 验证开关优先级：
   shouldVerifyTls = false 时，忽略所有 CA 配置，rejectUnauthorized = false
+
+重定向行为总览：
+  ✅ 重新评估：代理绕过规则、PAC 解析、Cookie、Agent 实例
+  ❌ 保持不变：客户端证书、CA 证书链、TLS 验证设置、代理模式、代理配置
 ```
 
 ### 10.3 常见组合场景
@@ -652,3 +801,10 @@ TLS 验证开关优先级：
 3. **MTLS 双向认证**：配置客户端证书，按域名自动匹配适用的证书
 4. **开发环境调试验证**：关闭 `shouldVerifyTls`，跳过证书验证（仅用于开发）
 5. **PAC 自动代理**：配置 PAC 源，由脚本动态选择代理服务器
+6. **OAuth2 跨域重定向**：OAuth2 认证流程中，令牌请求和重定向 URL 单独评估客户端证书匹配
+
+### 10.4 已知设计限制
+
+1. **跨域重定向客户端证书不切换**：重定向时不会重新匹配客户端证书，如 `A.com → B.com` 会沿用 `A.com` 的证书
+2. **单个请求仅支持一个客户端证书**：无法在一次请求生命周期内为不同域名使用不同客户端证书
+3. **重定向时代理配置不刷新**：代理模式和配置在请求开始时确定，重定向过程中不会重新读取偏好设置
