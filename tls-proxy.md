@@ -522,18 +522,19 @@ const httpProxyAgentOptions = isHttpsProxy ? { keepAlive: true, ...tlsOptions } 
 | 禁用 TLS 验证 | ❌ 不加载 CA 证书 | ✅ 仍可使用客户端证书（不推荐） | ✅ 代理不受影响 | `rejectUnauthorized = false` |
 | SOCKS 代理 → HTTPS 目标 | ✅ 用于验证目标服务器 | ✅ 用于目标服务器验证客户端 | ✅ SOCKS 认证 | SOCKS 代理本身不涉及 TLS |
 
-### 7.3 bru.sendRequest() 的配置继承
+### 7.3 bru.sendRequest() 的配置继承与重新评估
 
-脚本中调用 `bru.sendRequest()` 时，会继承主请求的证书和代理配置：
+脚本中调用 `bru.sendRequest()` 时，会继承主请求的**配置参数**，但会为脚本请求的 URL **重新执行**代理评估和证书匹配：
 
 ```typescript
 // send-request.ts:22-45
 const createSendRequest = (config?: SendRequestConfig) => {
   return async (requestConfig) => {
     if (config) {
+      // 传入继承的配置，但使用脚本请求的 URL 重新执行
       const { httpAgent, httpsAgent } = await getHttpHttpsAgents({
-        ...config,
-        requestUrl: normalizedConfig.url  // 使用脚本请求的 URL
+        ...config,                // 继承的配置（证书配置、代理配置等）
+        requestUrl: normalizedConfig.url  // ✅ 使用脚本请求的 URL
       });
       normalizedConfig.httpAgent = httpAgent;
       normalizedConfig.httpsAgent = httpsAgent;
@@ -544,13 +545,18 @@ const createSendRequest = (config?: SendRequestConfig) => {
 ```
 
 **关键点**：
-- 证书配置完全继承（CA、客户端证书、TLS 验证设置）
-- 代理配置继承，但代理绕过规则会**重新评估**脚本请求的 URL
-- 客户端证书的域名匹配也会**重新匹配**脚本请求的 URL
+- ✅ **证书配置参数继承**：CA 证书配置、TLS 验证设置等参数从主请求继承
+- ✅ **客户端证书重新匹配**：`getHttpHttpsAgents()` 内部会针对脚本请求的 URL **重新执行**客户端证书域名匹配
+- ✅ **代理配置参数继承**：代理模式、代理地址等参数从主请求继承
+- ✅ **代理绕过规则重新评估**：针对脚本请求的 URL **重新评估**代理绕过规则
+- ✅ **PAC 解析重新执行**：如果使用 PAC，会针对脚本请求的 URL **重新执行**
+- ⚠️ **Agent 缓存默认禁用**：`getHttpHttpsAgents()` 中 `disableCache` 默认为 `true`，每次都会创建新的 Agent 实例
 
-### 7.4 OAuth2 令牌请求的配置继承
+⚠️ **与重定向的关键区别**：`bru.sendRequest()` 会完整执行 `getHttpHttpsAgents()` 逻辑（包括客户端证书匹配），而重定向仅执行 `setupProxyAgents()`（不包含证书匹配）。
 
-OAuth2 流程中获取令牌时，会为令牌 URL 和刷新 URL 单独评估配置：
+### 7.4 OAuth2 令牌请求的独立配置评估
+
+OAuth2 流程中获取令牌时，**不是配置继承**，而是为令牌 URL 创建**独立的新请求**，单独调用 `getCertsAndProxyConfig()` 评估配置：
 
 ```javascript
 // index.js:179-226
@@ -558,15 +564,24 @@ if (accessTokenUrl && grantType !== 'implicit') {
   const tokenRequestForConfig = { ...requestCopy, url: interpolatedTokenUrl };
   certsAndProxyConfigForTokenUrl = await getCertsAndProxyConfig({
     ...,
-    request: tokenRequestForConfig  // 使用令牌 URL
+    request: tokenRequestForConfig  // 使用令牌 URL 独立评估
+  });
+  
+  // 使用独立的 axios 实例发送令牌请求
+  const axiosInstance = makeAxiosInstance({ 
+    proxyMode: certsAndProxyConfigForTokenUrl.proxyMode,
+    proxyConfig: certsAndProxyConfigForTokenUrl.proxyConfig,
+    httpsAgentRequestFields: certsAndProxyConfigForTokenUrl.httpsAgentRequestFields
   });
 }
 ```
 
 这意味着：
-- 如果令牌服务器域名匹配了某个客户端证书，会自动应用
-- 代理绕过规则对令牌 URL 单独评估
-- CA 证书配置保持一致
+- ✅ 如果令牌服务器域名匹配了某个客户端证书，会**独立匹配并应用**
+- ✅ 代理绕过规则对令牌 URL **单独评估**
+- ✅ CA 证书配置使用**独立评估**的结果（通常与主请求一致，因为 CA 配置不依赖 URL）
+
+⚠️ **关键区别**：与重定向不同，OAuth2 令牌请求是独立的新请求生命周期，会完整执行 `getCertsAndProxyConfig()`，包括客户端证书的域名匹配。
 
 ---
 
@@ -574,14 +589,16 @@ if (accessTokenUrl && grantType !== 'implicit') {
 
 ### 8.1 核心机制：闭包捕获
 
-理解重定向行为的关键在于 `makeAxiosInstance()` 的参数捕获机制：
+理解重定向行为的关键在于两个核心机制的叠加：
+
+#### 机制一：`makeAxiosInstance()` 的参数闭包捕获
 
 ```javascript
 // axios-instance.js:74-82
 function makeAxiosInstance({
   proxyMode = 'off',
   proxyConfig = {},
-  httpsAgentRequestFields = {},  // 这个参数被闭包捕获
+  httpsAgentRequestFields = {},  // ⚠️  这个参数被闭包捕获
   // ...
 } = {}) {
   const instance = axios.create({...});
@@ -592,12 +609,12 @@ function makeAxiosInstance({
     async (error) => {
       if (isRedirect(error)) {
         // ⚠️  这里使用的是闭包捕获的 httpsAgentRequestFields
-        // 不会重新调用 getCertsAndProxyConfig()
+        // ❌ 不会重新调用 getCertsAndProxyConfig()
         await setupProxyAgents({
           requestConfig,
           proxyMode,               // 闭包捕获 - 不变
           proxyConfig,             // 闭包捕获 - 不变
-          httpsAgentRequestFields, // 闭包捕获 - 不变！
+          httpsAgentRequestFields,  // 闭包捕获 - 不变！
           // ...
         });
       }
@@ -613,6 +630,26 @@ function makeAxiosInstance({
 - `rejectUnauthorized` - TLS 验证开关
 
 这些值在实例生命周期内**保持不变**，重定向时不会重新计算。
+
+#### 机制二：`setupProxyAgents()` 的 Agent 引用清除
+
+```javascript
+// proxy-util.js:124-127
+// Clear stale agents so we always recreate them for the current URL
+// (handles protocol switches, host changes, and proxy-bypass rules on redirects).
+delete requestConfig.httpAgent;
+delete requestConfig.httpsAgent;
+```
+
+⚠️ **代码注释与实际行为的细微差别**：
+- 注释写着 "always recreate them"，但实际是 `delete` 旧引用后调用 `getOrCreateHttpsAgent()`
+- 实际行为：**重新获取**（可能从缓存命中，也可能新建），而非始终"重新创建"
+- 清除旧引用的目的：确保重定向后的 URL 能正确应用代理绕过规则和协议切换
+
+两个机制共同作用的结果：
+- **证书配置**：闭包捕获，始终不变
+- **Agent 引用**：每次重定向都清除，然后重新获取（缓存或新建）
+- **代理规则**：针对新 URL 重新评估
 
 ### 8.2 重定向调用链路
 
@@ -636,8 +673,8 @@ CLI 端行为完全一致（`bruno-cli/src/utils/axios-instance.js:182-190`）�
 
 ### 8.3 什么会重建，什么会沿用
 
-| 配置项 | 重定向时是否重新评估 | 说明 |
-|--------|---------------------|------|
+| 配置项 | 重定向时行为 | 说明 |
+|--------|-------------|------|
 | **客户端证书** (cert/key/pfx/passphrase) | ❌ **沿用原始匹配** | 最关键的一点！`httpsAgentRequestFields` 是闭包捕获的，包含原始 URL 匹配的证书。`setupProxyAgents()` 内部**不会**重新调用 `getCertsAndProxyConfig()` 进行域名匹配。 |
 | **CA 证书链** (ca) | ❌ 沿用 | 同上，在 `httpsAgentRequestFields` 中 |
 | **TLS 验证开关** (rejectUnauthorized) | ❌ 沿用 | 同上 |
@@ -645,10 +682,86 @@ CLI 端行为完全一致（`bruno-cli/src/utils/axios-instance.js:182-190`）�
 | **代理配置** (proxyConfig) | ❌ 沿用 | 闭包捕获 |
 | **代理绕过规则** | ✅ 重新评估 | `setupProxyAgents()` 中调用 `shouldUseProxy(requestConfig.url, ...)`，使用**新 URL** 评估 |
 | **PAC 解析** | ✅ 重新执行 | `setupProxyAgents()` 中调用 `resolver.resolve(requestConfig.url)`，使用**新 URL** 执行 PAC 脚本 |
-| **Agent 实例** | ✅ 重新创建 | `setupProxyAgents()` 首先执行 `delete requestConfig.httpAgent/httpsAgent` 清除旧 Agent，然后创建新的 |
+| **Agent 实例** | 🔄 **重新获取（缓存或新建）** | `setupProxyAgents()` 首先 `delete requestConfig.httpAgent/httpsAgent` 清除旧引用，然后调用 `getOrCreateHttpsAgent()`。如果缓存 key 相同且 SSL 会话缓存启用，则复用缓存的 Agent；否则新建。详见 8.4 节。 |
 | **Cookie** | ✅ 重新获取 | 调用 `getCookieStringForUrl(redirectUrl)`，使用**新 URL** |
 
-### 8.4 跨域重定向的影响
+### 8.4 Agent 缓存与配置重建边界
+
+#### 8.4.1 缓存 Key 组成
+
+HTTPS Agent 缓存 Key 由以下要素哈希生成 (`agent-cache.ts:157-175`)：
+
+```typescript
+const keyData = {
+  agentClassId,          // Agent 类的唯一标识
+  hostname,              // 目标主机（无代理时）
+  proxyUri,              // 代理 URI（有代理时）
+  keepAlive,             // 连接保活
+  rejectUnauthorized,    // TLS 验证开关
+  ca: hashCaValue(ca),   // CA 证书链哈希
+  cert: hashValue(cert), // 客户端证书哈希
+  key: hashValue(key),   // 客户端私钥哈希
+  pfx: hashValue(pfx),   // PFX 证书哈希
+  passphrase: hashValue(passphrase),  // 密码哈希
+  minVersion,            // TLS 最低版本
+  secureProtocol         // TLS 协议版本
+};
+```
+
+**关键结论**：
+- 证书配置（CA、客户端证书、密码）的任何变化都会生成不同的缓存 Key
+- 代理 URI 变化也会生成不同的缓存 Key
+- 请求 URL 的**主机名**（无代理时）是缓存 Key 的一部分
+- 重定向时，由于 `httpsAgentRequestFields` 不变，证书部分的哈希值不变
+
+#### 8.4.2 缓存命中条件
+
+重定向时 Agent 是否命中缓存，取决于：
+
+```
+重定向后 Agent 缓存命中 = 
+  (SSL 会话缓存已启用) AND 
+  (代理 URI 不变 OR 代理绕过结果相同) AND 
+  (证书配置不变) AND
+  (目标主机名不变)
+```
+
+**代码证据**：
+```javascript
+// proxy-util.js:129
+const disableCache = !preferencesUtil.isSslSessionCachingEnabled();
+
+// agent-cache.ts:245
+if (!disableCache && agentCache.has(cacheKey)) {
+  // 命中缓存，更新 LRU 顺序
+  const agent = agentCache.get(cacheKey)!;
+  agentCache.delete(cacheKey);
+  agentCache.set(cacheKey, agent);
+  return agent;
+}
+// 未命中，创建新 Agent
+```
+
+#### 8.4.3 "配置重建" vs "连接复用" 边界
+
+| 层面 | 行为 | 边界条件 |
+|------|------|---------|
+| **引用层面** | 每次重定向都会 `delete` 旧 Agent 引用，然后重新获取 | ✅ 始终发生 |
+| **实例层面** | Agent 实例可能复用（缓存命中）或新建（缓存未命中） | 取决于缓存 Key 和 `disableCache` 标志 |
+| **连接层面** | 即使 Agent 实例复用，底层 socket 连接也可能是新建的 | 取决于 `keepAlive` 和连接池状态 |
+| **TLS 会话层面** | 同一 Agent 实例可能复用 TLS 会话（会话复用） | 需要 SSL 会话缓存启用 |
+
+#### 8.4.4 各端默认行为
+
+| 环境 | `disableCache` 默认值 | 说明 |
+|------|----------------------|------|
+| **Electron 桌面端** | `!preferencesUtil.isSslSessionCachingEnabled()` | 由用户偏好设置控制，默认通常为 `false`（启用缓存） |
+| **CLI 端** | `true` | 始终禁用缓存，每次都创建新 Agent |
+| **http-https-agents.ts（通用）** | `true` | 函数参数默认禁用缓存 |
+
+⚠️ **重要**：CLI 端和 `getHttpHttpsAgents()` 函数默认禁用 Agent 缓存，这意味着每次请求（包括重定向）都会创建新的 Agent 实例。
+
+### 8.5 跨域重定向的影响
 
 **⚠️ 重要限制**：跨域重定向时，客户端证书不会自动切换。
 
@@ -687,7 +800,7 @@ async function setupProxyAgents({ httpsAgentRequestFields, ... }) {
 
 **注意**：CA 证书配置不受跨域影响，因为 CA 证书是合并后的证书链，用于验证所有服务器证书。
 
-### 8.5 排障建议
+### 8.6 排障建议
 
 #### 问题 1：跨域重定向后客户端认证失败
 
@@ -735,13 +848,51 @@ async function setupProxyAgents({ httpsAgentRequestFields, ... }) {
 2. 检查 `httpsAgentRequestFields.rejectUnauthorized` 是否为 `false`
 3. 注意：TLS 验证设置**不会**因重定向而改变
 
+#### 问题 5：Agent 缓存导致的 TLS 会话复用问题
+
+**现象**：更换客户端证书或 CA 证书后，某些请求仍然使用旧的证书配置，或出现 TLS 握手错误。
+
+**排查步骤**：
+1. 查看 timeline 中是否有 `Reusing cached https agent` 日志
+2. 确认 SSL 会话缓存偏好设置是否开启（桌面端）
+3. 检查缓存 Key 组成要素是否发生变化：
+   - 客户端证书（cert/key/pfx/passphrase）的内容哈希
+   - CA 证书链的内容哈希
+   - 代理 URI
+   - 目标主机名（无代理时）
+4. CLI 端：确认 `cacheSslSession` 选项是否设置为 `true`
+
+**解决方案**：
+- **方案 A**：在偏好设置中关闭 SSL 会话缓存（桌面端）
+- **方案 B**：CLI 端添加 `--cache-ssl-session=false` 参数
+- **方案 C**：重启应用以清除内存中的 Agent 缓存
+- **方案 D**：确认证书文件内容确实已更新（变量插值可能引入缓存）
+
+**注意**：缓存 Key 使用证书内容的哈希值，而非文件路径。只要证书内容不变，即使修改了文件路径，也会命中缓存。
+
+#### 问题 6：跨域重定向后代理行为异常
+
+**现象**：从 `A.com` 重定向到 `B.com`，代理绕过规则或 PAC 选择的代理不正确。
+
+**排查步骤**：
+1. 确认代理绕过规则是否同时覆盖了 `A.com` 和 `B.com`
+2. 检查 PAC 脚本是否正确处理了 `B.com` 域名
+3. 查看 timeline 中的代理模式和 PAC 解析结果
+4. 注意：代理模式和配置本身不会因重定向而改变，但**代理绕过规则和 PAC 解析**会针对重定向后的 URL 重新评估
+
 #### 通用排障技巧
 
-1. **启用 timeline 查看**：每个请求的 timeline 会记录代理模式、PAC 解析结果、证书使用情况
+1. **启用 timeline 查看**：每个请求的 timeline 会记录代理模式、PAC 解析结果、证书使用情况、Agent 缓存命中情况
 2. **检查代理模式日志**：timeline 中会有 `Proxy mode: on | system | pac | off` 条目
-3. **确认请求 URL**：检查 timeline 中的 `Preparing request to {url}` 确认实际请求的 URL
-4. **对比直接请求**：尝试直接请求重定向后的 URL，对比行为差异
-5. **查看 Node.js 调试日志**：设置 `DEBUG=*` 查看底层 TLS 握手日志
+3. **检查 Agent 缓存日志**：timeline 中会有 `Reusing cached https agent` 或 `Reusing cached http agent` 条目表示缓存命中
+4. **确认请求 URL**：检查 timeline 中的 `Preparing request to {url}` 确认实际请求的 URL
+5. **对比直接请求**：尝试直接请求重定向后的 URL，对比行为差异（直接请求会重新匹配客户端证书）
+6. **区分请求类型**：
+   - 🔄 **重定向**：沿用原始证书，仅重新评估代理规则
+   - 🆕 **`bru.sendRequest()`**：重新匹配客户端证书，重新评估代理规则
+   - 🆕 **OAuth2 令牌请求**：独立的新请求，完整重新评估所有配置
+7. **查看 Node.js 调试日志**：设置 `DEBUG=*` 查看底层 TLS 握手日志
+8. **关闭 SSL 会话缓存测试**：在偏好设置中关闭 SSL 会话缓存，观察问题是否消失
 
 ---
 
@@ -753,12 +904,16 @@ async function setupProxyAgents({ httpsAgentRequestFields, ... }) {
 | 证书与代理配置获取（Electron） | `packages/bruno-electron/src/ipc/network/cert-utils.js` | 13-165 |
 | Agent 创建（通用） | `packages/bruno-requests/src/utils/http-https-agents.ts` | 530-571 |
 | Agent 创建（CLI） | `packages/bruno-cli/src/utils/proxy-util.js` | 105-198 |
+| Agent 创建（Electron） | `packages/bruno-electron/src/utils/proxy-util.js` | 107-264 |
 | 代理配置格式转换 | `packages/bruno-requests/src/utils/proxy-util.ts` | 40-92 |
 | Axios 实例与拦截器（Electron） | `packages/bruno-electron/src/ipc/network/axios-instance.js` | 74-502 |
+| Axios 实例与拦截器（CLI） | `packages/bruno-cli/src/utils/axios-instance.js` | 62-205 |
 | 脚本请求代理继承 | `packages/bruno-requests/src/scripting/send-request.ts` | 22-76 |
 | 请求执行入口（Electron） | `packages/bruno-electron/src/ipc/network/index.js` | 101-359 |
 | PAC 代理解析 | `packages/bruno-requests/src/utils/pac-resolver.ts` | - |
-| Agent 缓存 | `packages/bruno-requests/src/utils/agent-cache.ts` | - |
+| Agent 缓存实现 | `packages/bruno-requests/src/utils/agent-cache.ts` | 1-402 |
+| PatchedHttpsProxyAgent | `packages/bruno-requests/src/utils/http-https-agents.ts` | 218-240 |
+| OAuth2 令牌请求 | `packages/bruno-electron/src/utils/oauth2.js` | 56-100 |
 
 ---
 
@@ -768,10 +923,14 @@ async function setupProxyAgents({ httpsAgentRequestFields, ... }) {
 
 1. **集中配置，分散执行**：`getCertsAndProxyConfig()` 在请求准备阶段统一聚合配置，实际 Agent 创建在请求拦截器中执行
 2. **层级覆盖**：集合级配置 > 应用级配置 > 系统级配置
-3. **URL 感知（部分）**：代理绕过、PAC 解析、Cookie 获取针对具体 URL 评估；**但客户端证书匹配仅在初始请求时评估一次**
-4. **闭包捕获机制**：`makeAxiosInstance()` 创建时捕获的配置在实例生命周期内保持不变，重定向时不重新计算
+3. **URL 感知（分场景）**：
+   - ✅ 代理绕过、PAC 解析、Cookie 获取始终针对具体 URL 评估
+   - ✅ 客户端证书匹配：在**新请求生命周期**（初始请求、`bru.sendRequest()`、OAuth2 令牌请求）中针对 URL 评估
+   - ❌ 客户端证书匹配：在**重定向**时不重新评估，沿用初始匹配
+4. **闭包捕获机制**：`makeAxiosInstance()` 创建时捕获的 `httpsAgentRequestFields`、`proxyMode`、`proxyConfig` 在实例生命周期内保持不变，重定向时不重新计算
 5. **重定向部分重评估**：重定向时仅重新评估 URL 相关的代理规则，证书配置保持不变
-6. **变量插值**：所有配置字段支持环境变量插值，增强灵活性
+6. **Agent 缓存可配置**：Agent 实例缓存由 `disableCache` 标志控制，不同环境有不同默认值
+7. **变量插值**：所有配置字段支持环境变量插值，增强灵活性
 
 ### 10.2 优先级总览
 
@@ -790,7 +949,8 @@ TLS 验证开关优先级：
   shouldVerifyTls = false 时，忽略所有 CA 配置，rejectUnauthorized = false
 
 重定向行为总览：
-  ✅ 重新评估：代理绕过规则、PAC 解析、Cookie、Agent 实例
+  ✅ 重新评估：代理绕过规则、PAC 解析、Cookie
+  🔄 重新获取：Agent 实例（缓存或新建，取决于缓存 Key 和 disableCache 标志）
   ❌ 保持不变：客户端证书、CA 证书链、TLS 验证设置、代理模式、代理配置
 ```
 
@@ -801,10 +961,11 @@ TLS 验证开关优先级：
 3. **MTLS 双向认证**：配置客户端证书，按域名自动匹配适用的证书
 4. **开发环境调试验证**：关闭 `shouldVerifyTls`，跳过证书验证（仅用于开发）
 5. **PAC 自动代理**：配置 PAC 源，由脚本动态选择代理服务器
-6. **OAuth2 跨域重定向**：OAuth2 认证流程中，令牌请求和重定向 URL 单独评估客户端证书匹配
+6. **OAuth2 令牌请求**：OAuth2 认证流程中，令牌请求是**独立的新请求**，会单独调用 `getCertsAndProxyConfig()` 评估客户端证书匹配
 
 ### 10.4 已知设计限制
 
 1. **跨域重定向客户端证书不切换**：重定向时不会重新匹配客户端证书，如 `A.com → B.com` 会沿用 `A.com` 的证书
-2. **单个请求仅支持一个客户端证书**：无法在一次请求生命周期内为不同域名使用不同客户端证书
-3. **重定向时代理配置不刷新**：代理模式和配置在请求开始时确定，重定向过程中不会重新读取偏好设置
+2. **单个请求生命周期仅支持一个客户端证书**：在一次 axios 实例生命周期内（包括所有重定向），无法为不同域名使用不同客户端证书
+3. **重定向时代理配置不刷新**：代理模式和配置在 `makeAxiosInstance()` 创建时确定，重定向过程中不会重新读取偏好设置
+4. **CLI 端默认禁用 Agent 缓存**：CLI 环境下 `disableCache=true`，每次请求（包括重定向）都会创建新的 Agent 实例
