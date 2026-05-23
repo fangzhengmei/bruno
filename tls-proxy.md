@@ -550,7 +550,7 @@ const createSendRequest = (config?: SendRequestConfig) => {
 - ✅ **代理配置参数继承**：代理模式、代理地址等参数从主请求继承
 - ✅ **代理绕过规则重新评估**：针对脚本请求的 URL **重新评估**代理绕过规则
 - ✅ **PAC 解析重新执行**：如果使用 PAC，会针对脚本请求的 URL **重新执行**
-- ⚠️ **Agent 缓存默认禁用**：`getHttpHttpsAgents()` 中 `disableCache` 默认为 `true`，每次都会创建新的 Agent 实例
+- ⚠️ **Agent 缓存默认禁用**：`getHttpHttpsAgents()` 中 `disableCache` 默认为 `true`，默认每次都会创建新的 Agent 实例；但调用方可传入 `disableCache: false` 启用缓存
 
 ⚠️ **与重定向的关键区别**：`bru.sendRequest()` 会完整执行 `getHttpHttpsAgents()` 逻辑（包括客户端证书匹配），而重定向仅执行 `setupProxyAgents()`（不包含证书匹配）。
 
@@ -720,17 +720,36 @@ const keyData = {
 
 ```
 重定向后 Agent 缓存命中 = 
-  (SSL 会话缓存已启用) AND 
-  (代理 URI 不变 OR 代理绕过结果相同) AND 
-  (证书配置不变) AND
-  (目标主机名不变)
+  (disableCache = false) AND 
+  (agentCache 中存在匹配的 cacheKey)
 ```
 
-**代码证据**：
+其中 `cacheKey` 由以下要素组成：
+- `disableCache` 标志
+- 代理 URI（有代理时）或目标主机名（无代理时）
+- 证书配置哈希（CA、客户端证书、密码等）
+- `keepAlive`、`rejectUnauthorized` 等连接选项
+- Agent 类标识
+
+**分端代码证据**：
+
+**Electron 桌面端**：
 ```javascript
 // proxy-util.js:129
 const disableCache = !preferencesUtil.isSslSessionCachingEnabled();
+// 由用户偏好设置控制，默认通常为 false（启用缓存）
+```
 
+**CLI 端**：
+```javascript
+// run-single-request.js:354
+const disableCache = !get(options, 'cacheSslSession', false);
+// 默认 cacheSslSession = false → disableCache = true（禁用缓存）
+// 只有显式指定 --cache-ssl-session flag 时，disableCache = false（启用缓存）
+```
+
+**通用缓存命中逻辑**：
+```javascript
 // agent-cache.ts:245
 if (!disableCache && agentCache.has(cacheKey)) {
   // 命中缓存，更新 LRU 顺序
@@ -739,8 +758,13 @@ if (!disableCache && agentCache.has(cacheKey)) {
   agentCache.set(cacheKey, agent);
   return agent;
 }
-// 未命中，创建新 Agent
+// 未命中或禁用缓存，创建新 Agent
 ```
+
+⚠️ **重要修正**：
+- CLI 端**默认禁用**缓存（`disableCache = true`），这意味着默认情况下重定向时**必定创建新 Agent**，不会命中缓存
+- 只有显式指定 `--cache-ssl-session` flag 时，CLI 端才会启用缓存，重定向时才可能命中缓存
+- Electron 端默认启用缓存，重定向时可能命中缓存（如果 cacheKey 匹配）
 
 #### 8.4.3 "配置重建" vs "连接复用" 边界
 
@@ -756,7 +780,7 @@ if (!disableCache && agentCache.has(cacheKey)) {
 | 环境 | `disableCache` 默认值 | 说明 |
 |------|----------------------|------|
 | **Electron 桌面端** | `!preferencesUtil.isSslSessionCachingEnabled()` | 由用户偏好设置控制，默认通常为 `false`（启用缓存） |
-| **CLI 端** | `true` | **默认**禁用缓存，但可通过 `--cache-ssl-session` 参数启用 |
+| **CLI 端** | `true` | **默认**禁用缓存，但可通过 `--cache-ssl-session` flag 启用 |
 | **http-https-agents.ts（通用）** | `true` | 函数参数默认禁用缓存，调用方可传入 `disableCache: false` 启用 |
 
 **CLI 端 `cacheSslSession` 与 `disableCache` 的关系**：
@@ -767,15 +791,16 @@ const disableCache = !get(options, 'cacheSslSession', false);
 - `--cache-ssl-session` 未指定（默认）：`cacheSslSession = false` → `disableCache = true` → 禁用缓存
 - `--cache-ssl-session` 显式指定：`cacheSslSession = true` → `disableCache = false` → 启用缓存
 
-**`--cache-ssl-session` 参数含义**（`run.js:228-232`）：
+**`--cache-ssl-session` flag 含义**（`run.js:228-232`）：
 - 类型：boolean flag（无需参数值）
 - 默认：false
 - 作用：Enable SSL session caching — reuses TLS sessions across requests for faster handshakes
 
 ⚠️ **重要**：
-- CLI 端**默认**禁用 Agent 缓存，但指定 `--cache-ssl-session` 后启用
-- 启用缓存后，重定向时也会尝试命中缓存（如果缓存 Key 匹配）
+- CLI 端**默认**禁用 Agent 缓存（`disableCache = true`），但显式指定 `--cache-ssl-session` flag 后启用
+- 启用缓存后，重定向时也会尝试命中缓存（如果缓存 Key 匹配，因为重定向时 `disableCache` 会被透传）
 - `getHttpHttpsAgents()` 函数默认禁用缓存，但调用方可传入 `disableCache: false` 覆盖
+- 重定向时，`disableCache` 标志从 `makeAxiosInstance()` 闭包中获取并透传给 `setupProxyAgents()`，保持与初始请求一致
 
 ### 8.5 跨域重定向的影响
 
@@ -869,22 +894,39 @@ async function setupProxyAgents({ httpsAgentRequestFields, ... }) {
 **现象**：更换客户端证书或 CA 证书后，某些请求仍然使用旧的证书配置，或出现 TLS 握手错误。
 
 **排查步骤**：
-1. 查看 timeline 中是否有 `Reusing cached https agent` 日志
+1. 查看 timeline 中是否有 `Reusing cached https agent` 或 `Reusing cached http agent` 日志
 2. 确认 SSL 会话缓存偏好设置是否开启（桌面端）
 3. 检查缓存 Key 组成要素是否发生变化：
    - 客户端证书（cert/key/pfx/passphrase）的内容哈希
    - CA 证书链的内容哈希
    - 代理 URI
    - 目标主机名（无代理时）
-4. CLI 端：确认 `cacheSslSession` 选项是否设置为 `true`
+4. CLI 端：确认是否显式指定了 `--cache-ssl-session` flag
+
+**代码证据**：
+```javascript
+// CLI 默认行为：run-single-request.js:354
+const disableCache = !get(options, 'cacheSslSession', false);
+// 默认 cacheSslSession = false → disableCache = true → 禁用缓存
+
+// 重定向时透传：axios-instance.js:189
+setupProxyAgents({
+  // ...
+  disableCache  // 从 makeAxiosInstance 闭包中透传，保持一致
+});
+```
 
 **解决方案**：
 - **方案 A**：在偏好设置中关闭 SSL 会话缓存（桌面端）
-- **方案 B**：CLI 端添加 `--cache-ssl-session=false` 参数
-- **方案 C**：重启应用以清除内存中的 Agent 缓存
-- **方案 D**：确认证书文件内容确实已更新（变量插值可能引入缓存）
+- **方案 B**：CLI 端默认已禁用缓存，无需额外参数；如需强制禁用，确保**不**指定 `--cache-ssl-session` flag
+- **方案 C**：如需在 CLI 端启用缓存，添加 `--cache-ssl-session` flag（不带参数值）
+- **方案 D**：重启应用以清除内存中的 Agent 缓存
+- **方案 E**：确认证书文件内容确实已更新（变量插值可能引入缓存）
 
-**注意**：缓存 Key 使用证书内容的哈希值，而非文件路径。只要证书内容不变，即使修改了文件路径，也会命中缓存。
+**注意**：
+- 缓存 Key 使用证书**内容**的哈希值，而非文件路径。只要证书内容不变，即使修改了文件路径，也会命中缓存
+- CLI 端**默认禁用**缓存（`disableCache = true`），默认每次请求（包括重定向）都会创建新的 Agent 实例
+- 只有显式指定 `--cache-ssl-session` flag 时，CLI 端才会启用缓存
 
 #### 问题 6：跨域重定向后代理行为异常
 
@@ -908,7 +950,9 @@ async function setupProxyAgents({ httpsAgentRequestFields, ... }) {
    - 🆕 **`bru.sendRequest()`**：重新匹配客户端证书，重新评估代理规则
    - 🆕 **OAuth2 令牌请求**：独立的新请求，完整重新评估所有配置
 7. **查看 Node.js 调试日志**：设置 `DEBUG=*` 查看底层 TLS 握手日志
-8. **关闭 SSL 会话缓存测试**：在偏好设置中关闭 SSL 会话缓存，观察问题是否消失
+8. **关闭 SSL 会话缓存测试**：
+   - 桌面端：在偏好设置中关闭 SSL 会话缓存，观察问题是否消失
+   - CLI 端：默认已禁用缓存；如需启用缓存测试，添加 `--cache-ssl-session` flag
 
 ---
 
@@ -984,4 +1028,4 @@ TLS 验证开关优先级：
 1. **跨域重定向客户端证书不切换**：重定向时不会重新匹配客户端证书，如 `A.com → B.com` 会沿用 `A.com` 的证书
 2. **单个请求生命周期仅支持一个客户端证书**：在一次 axios 实例生命周期内（包括所有重定向），无法为不同域名使用不同客户端证书
 3. **重定向时代理配置不刷新**：代理模式和配置在 `makeAxiosInstance()` 创建时确定，重定向过程中不会重新读取偏好设置
-4. **CLI 端默认禁用 Agent 缓存**：CLI 环境下 `disableCache=true`，每次请求（包括重定向）都会创建新的 Agent 实例
+4. **CLI 端默认禁用 Agent 缓存**：CLI 环境下默认 `disableCache=true`，每次请求（包括重定向）都会创建新的 Agent 实例；但可通过 `--cache-ssl-session` flag 启用缓存
