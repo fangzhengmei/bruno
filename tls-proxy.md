@@ -756,10 +756,26 @@ if (!disableCache && agentCache.has(cacheKey)) {
 | 环境 | `disableCache` 默认值 | 说明 |
 |------|----------------------|------|
 | **Electron 桌面端** | `!preferencesUtil.isSslSessionCachingEnabled()` | 由用户偏好设置控制，默认通常为 `false`（启用缓存） |
-| **CLI 端** | `true` | 始终禁用缓存，每次都创建新 Agent |
-| **http-https-agents.ts（通用）** | `true` | 函数参数默认禁用缓存 |
+| **CLI 端** | `true` | **默认**禁用缓存，但可通过 `--cache-ssl-session` 参数启用 |
+| **http-https-agents.ts（通用）** | `true` | 函数参数默认禁用缓存，调用方可传入 `disableCache: false` 启用 |
 
-⚠️ **重要**：CLI 端和 `getHttpHttpsAgents()` 函数默认禁用 Agent 缓存，这意味着每次请求（包括重定向）都会创建新的 Agent 实例。
+**CLI 端 `cacheSslSession` 与 `disableCache` 的关系**：
+```javascript
+// run-single-request.js:354
+const disableCache = !get(options, 'cacheSslSession', false);
+```
+- `--cache-ssl-session` 未指定（默认）：`cacheSslSession = false` → `disableCache = true` → 禁用缓存
+- `--cache-ssl-session` 显式指定：`cacheSslSession = true` → `disableCache = false` → 启用缓存
+
+**`--cache-ssl-session` 参数含义**（`run.js:228-232`）：
+- 类型：boolean flag（无需参数值）
+- 默认：false
+- 作用：Enable SSL session caching — reuses TLS sessions across requests for faster handshakes
+
+⚠️ **重要**：
+- CLI 端**默认**禁用 Agent 缓存，但指定 `--cache-ssl-session` 后启用
+- 启用缓存后，重定向时也会尝试命中缓存（如果缓存 Key 匹配）
+- `getHttpHttpsAgents()` 函数默认禁用缓存，但调用方可传入 `disableCache: false` 覆盖
 
 ### 8.5 跨域重定向的影响
 
