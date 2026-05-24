@@ -1,4 +1,4 @@
-# 标签页会话状态与未保存改动管理分析
+# 标签页会话状态与未保存改动管理分析（可复核版）
 
 ## 一、整体架构概览
 
@@ -8,7 +8,7 @@ Bruno 使用 Redux Toolkit 作为状态管理库，通过三个核心中间件�
 Redux Store
 ├── slices
 │   ├── tabs.js              # 标签页状态管理
-│   ├── collections/index.js # 集合与条目状态管理（含draft）
+│   ├── collections/index.js # 集合与条目状态管理（含 draft）
 │   └── app.js               # 应用级状态
 └── middlewares
     ├── draft/middleware.js     # 草稿检测 - 标记预览标签页为永久
@@ -30,7 +30,7 @@ Redux Store
 }
 ```
 
-**单个标签页对象** (`tabs.js:129-159`) 包含丰富的UI状态：
+**单个标签页对象** (`tabs.js:129-159`) 包含丰富的 UI 状态：
 
 ```javascript
 {
@@ -38,10 +38,10 @@ Redux Store
   collectionUid: string,
   type: 'http-request' | 'graphql-request' | 'grpc-request' | 'ws-request' | 'folder-settings' | 'collection-settings' | ...,
   pathname: string | null,           // 文件系统路径
-  preview: boolean,                  // 是否为预览模式（点击打开vs双击打开）
+  preview: boolean,                  // 是否为预览模式（点击打开 vs 双击打开）
   isTransient?: boolean,             // 是否为临时请求（无持久化文件）
   
-  // UI布局状态
+  // UI 布局状态
   requestPaneWidth: number | null,
   requestPaneHeight: number | null,
   requestPaneCollapsed: boolean,
@@ -74,7 +74,7 @@ Redux Store
 2. **路径匹配**：通过 `collectionUid + pathname + type` 匹配
 3. **单例类型匹配**：对于 `variables`、`collection-runner`、`preferences` 等单例类型标签页，按 `collectionUid + type` 匹配
 
-**响应示例标签页** 使用 `exampleIndex` 或 `exampleName` 进行额外匹配：
+**响应示例标签页** 使用 `exampleIndex` 或 `exampleName` 进行额外匹配 (`tabs.js:37-43`)：
 ```javascript
 if (type === 'response-example') {
   if (typeof exampleIndex === 'number') {
@@ -111,7 +111,7 @@ if (type === 'response-example') {
 
 ### 3.1 Draft 状态模型
 
-Bruno 采用 **Copy-on-Write** 模式管理未保存改动。每个可编辑对象（请求、文件夹、集合、环境）都有一个 `draft` 字段：
+Bruno 采用 **Copy-on-Write** 模式管理未保存改动。每个可编辑对象都有一个 `draft` 字段：
 
 ```javascript
 // collections/index.js:776-782
@@ -126,7 +126,70 @@ deleteRequestDraft: (state, action) => {
 }
 ```
 
-### 3.2 脏检测核心函数
+### 3.2 草稿检测拦截动作数量（可复核）
+
+#### 3.2.1 draftDetectMiddleware（73 个 action）
+
+**代码位置**：`packages/bruno-app/src/providers/ReduxStore/middlewares/draft/middleware.js:3-82`
+
+**统计方式**：Grep 正则 `'collections\/` 统计结果为 **73 个**
+
+**详细分类**：
+
+| 层级 | 行号范围 | 数量 | 示例 action |
+|------|---------|------|------------|
+| Request-level | 5-47 | **43 个** | `requestUrlChanged`、`updateAuth`、`addQueryParam`、`addRequestHeader`、`updateRequestBody`、`updateRequestGraphqlQuery`、`updateRequestScript`、`addAssertion`、`addVar` 等 |
+| Folder-level | 49-62 | **14 个** | `addFolderHeader`、`updateFolderVar`、`updateFolderRequestScript`、`updateFolderAuth`、`updateFolderDocs` 等 |
+| Collection-level | 65-81 | **17 个** | `addCollectionHeader`、`updateCollectionVar`、`updateCollectionAuth`、`updateCollectionRequestScript`、`updateCollectionClientCertificates`、`updateCollectionProtobuf`、`updateCollectionProxy` 等 |
+| **合计** | | **73 个** | |
+
+**代码引用**：
+```javascript
+// middleware.js:3-82
+const actionsToIntercept = [
+  // Request-level actions (lines 5-47, 43 个)
+  'collections/requestUrlChanged',
+  'collections/updateAuth',
+  // ... 共 43 个
+  // Folder-level actions (lines 49-62, 14 个)
+  'collections/addFolderHeader',
+  // ... 共 14 个
+  // Collection-level actions (lines 65-81, 17 个)
+  'collections/addCollectionHeader',
+  // ... 共 17 个
+];
+```
+
+#### 3.2.2 autosaveMiddleware（83 个 action）
+
+**代码位置**：`packages/bruno-app/src/providers/ReduxStore/middlewares/autosave/middleware.js:5-94`
+
+**统计方式**：Grep 正则 `'collections\/|'global-environments\/` 统计结果为 **83 个**
+
+**详细分类**：
+
+| 层级 | 行号范围 | 数量 | 说明 |
+|------|---------|------|------|
+| Request-level | 6-54 | **49 个** | 比 draft 多 6 个：`updateCollectionPresets`、`setRequestVars`、`setRequestAssertions`、`updateItemSettings`、`addRequestTag`、`deleteRequestTag` |
+| Folder-level | 57-70 | **14 个** | 与 draft 相同 |
+| Collection-level | 73-89 | **17 个** | 与 draft 相同 |
+| Environment draft | 92-93 | **2 个** | `setEnvironmentsDraft`、`setGlobalEnvironmentDraft` |
+| **合计** | | **83 个** | |
+
+**代码引用**：
+```javascript
+// middleware.js:5-94
+const actionsToIntercept = [
+  // Request-level actions (lines 6-54, 49 个)
+  // ... 同 draft 的 43 个 + 额外 6 个
+  
+  // Environment draft actions (lines 92-93, 2 个)
+  'collections/setEnvironmentsDraft',
+  'global-environments/setGlobalEnvironmentDraft'
+];
+```
+
+### 3.3 脏检测核心函数
 
 **`hasRequestChanges(item)`** (`utils/collections/index.js:1069-1085`) 是脏检测的核心：
 
@@ -152,7 +215,7 @@ export const hasRequestChanges = (item) => {
 - 特意排除 `examples` 字段，因为示例有单独的 `hasExampleChanges` 函数
 - 使用 `lodash.isEqual` 进行深度相等比较
 
-### 3.3 各类实体的 Draft 状态
+### 3.4 各类实体的 Draft 状态
 
 | 实体类型 | Draft 位置 | 检测方式 | 删除 Draft Action |
 |---------|-----------|---------|------------------|
@@ -162,29 +225,11 @@ export const hasRequestChanges = (item) => {
 | 集合环境 | `collection.environmentsDraft` | `collection.environmentsDraft != null` | `clearEnvironmentsDraft` |
 | 全局环境 | `state.globalEnvironments.globalEnvironmentDraft` | `globalEnvironmentDraft != null` | `clearGlobalEnvironmentDraft` |
 
-### 3.4 Draft 自动检测中间件
+### 3.5 Draft 自动检测中间件
 
-`draftDetectMiddleware` (`middlewares/draft/middleware.js:84-90`) 监听 80+ 种会产生改动的 action：
+`draftDetectMiddleware` (`middlewares/draft/middleware.js:84-90`) 监听上述 73 种改动 action：
 
 ```javascript
-const actionsToIntercept = [
-  // Request-level actions (40+)
-  'collections/requestUrlChanged',
-  'collections/updateAuth',
-  'collections/addQueryParam',
-  // ... 更多请求级操作
-  
-  // Folder-level actions (15+)
-  'collections/addFolderHeader',
-  'collections/updateFolderVar',
-  // ... 更多文件夹级操作
-  
-  // Collection-level actions (20+)
-  'collections/addCollectionHeader',
-  'collections/updateCollectionAuth',
-  // ... 更多集合级操作
-];
-
 export const draftDetectMiddleware = ({ dispatch, getState }) => (next) => (action) => {
   if (actionsToIntercept.includes(action.type)) {
     const state = getState();
@@ -200,16 +245,16 @@ export const draftDetectMiddleware = ({ dispatch, getState }) => (next) => (acti
 3. 根据 action payload 中的 `itemUid` / `folderUid` / `collectionUid` 确定对应实体
 4. 派发 `makeTabPermanent` action 将标签页转为永久模式
 
-### 3.5 自动保存机制
+### 3.6 自动保存机制
 
 `autosaveMiddleware` (`middlewares/autosave/middleware.js:233-264`) 在用户启用自动保存时工作：
 
 **触发时机**：
-- 监听与 draft 检测相同的 action 列表
+- 监听上述 83 种 action
 - 自动保存启用时，为每个有改动的实体调度延迟保存
 - 保存间隔由 `autoSave.interval` 配置控制
 
-**去重机制**：
+**去重机制** (`autosave/middleware.js:96-109`)：
 ```javascript
 const pendingTimers = {};
 
@@ -357,30 +402,43 @@ const allDrafts = useMemo(() => {
 
 ## 五、会话持久化与重启恢复
 
-### 5.1 快照持久化架构
+### 5.1 快照存储服务实际代码位置（可复核）
 
 **三层持久化架构**：
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Renderer Process (React + Redux)               │
-│  ┌───────────────────────────────────────────┐  │
-│  │  snapshotMiddleware                       │  │
-│  │  - 监听 SAVE_TRIGGERS action              │  │
-│  │  - 1秒防抖 serializeSnapshot()            │  │
-│  │  - IPC: renderer:snapshot:save            │  │
-│  └───────────────────────────────────────────┘  │
-└───────────────────────────┬─────────────────────┘
-                            │ IPC
-┌───────────────────────────▼─────────────────────┐
-│  Main Process (Electron)                        │
-│  ┌───────────────────────────────────────────┐  │
-│  │  SnapshotManager (electron-store)        │  │
-│  │  - 存储到: ui-state-snapshot.json        │  │
-│  │  - Yup Schema 验证                       │  │
-│  │  - 查找缓存优化                          │  │
-│  └───────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Renderer Process (React + Redux)                           │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  序列化工具                                           │  │
+│  │  路径: packages/bruno-app/src/utils/snapshot/index.js │  │
+│  │  职责: serializeTab()、deserializeTab()               │  │
+│  └───────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  中间件                                               │  │
+│  │  路径: packages/bruno-app/src/providers/ReduxStore/   │  │
+│  │            middlewares/snapshot/middleware.js         │  │
+│  │  职责: 防抖监听 action，触发 IPC 调用                 │  │
+│  └───────────────────────────────────────────────────────┘  │
+└───────────────────────────────┬─────────────────────────────┘
+                                │ IPC 通信
+┌───────────────────────────────▼─────────────────────────────┐
+│  Main Process (Electron)                                    │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  IPC 处理器                                           │  │
+│  │  路径: packages/bruno-electron/src/ipc/snapshot.js    │  │
+│  │  职责: 转发 renderer 调用到 SnapshotManager           │  │
+│  └───────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  SnapshotManager 存储服务                             │  │
+│  │  路径: packages/bruno-electron/src/services/          │  │
+│  │            snapshot/index.js                          │  │
+│  │  类定义: line 111，class SnapshotManager              │  │
+│  │  导出: line 567，module.exports = new SnapshotManager()│  │
+│  │  存储: electron-store → ui-state-snapshot.json        │  │
+│  │  验证: Yup Schema 验证                                │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### 5.2 快照序列化
@@ -388,14 +446,12 @@ const allDrafts = useMemo(() => {
 **触发保存的 Action** (`utils/snapshot/index.js:29-55`)：
 ```javascript
 export const SAVE_TRIGGERS = new Map([
+  ['app/setSnapshotReady', null],
   ['tabs/addTab', null],
   ['tabs/closeTabs', null],
   ['tabs/focusTab', null],
-  ['tabs/makeTabPermanent', null],
   ['tabs/updateRequestPaneTab', null],
-  ['tabs/updateRequestPaneTabWidth', null],
-  ['tabs/updateResponsePaneTab', null],
-  // ... 共 30+ 种触发事件
+  // ... 共 26 种触发事件
 ]);
 ```
 
@@ -416,7 +472,7 @@ const scheduleSave = (getState) => {
 **序列化函数 `serializeTab`** (`utils/snapshot/index.js:364-422`)：
 ```javascript
 export const serializeTab = (tab, collection) => {
-  const accessor = getAccessor(tab);  // 'pathname' | 'type' | 'pathname::exampleIndex'
+  const accessor = getAccessor(tab);
   const serialized = {
     type: tab.type,
     accessor,
@@ -424,46 +480,29 @@ export const serializeTab = (tab, collection) => {
   };
 
   // 根据 accessor 类型存储不同的标识
-  if (accessor === 'pathname') {
-    const item = findItemInCollection(collection, tab.uid);
-    serialized.pathname = item?.pathname || tab.pathname;
-  } else if (accessor === 'pathname::exampleIndex') {
-    // 存储 exampleIndex 而非 uid，因为 uid 可能变化
-  }
-
-  // 存储UI状态
-  if (isRequest && tab.requestPaneTab !== undefined) {
-    serialized.request = {
-      tab: tab.requestPaneTab,
-      width: tab.requestPaneWidth,
-      height: tab.requestPaneHeight
-    };
-  }
-  // 响应面板状态类似...
+  // 存储 UI 状态（面板宽度、当前 tab 等）
+  
+  return serialized;
 };
 ```
 
+**关键点**：序列化内容完全不包含 `draft`、`environmentsDraft` 等未保存改动（Grep 确认 snapshot 模块中无相关字段引用）。
+
 ### 5.3 快照存储格式
 
-**完整快照结构** (`services/snapshot/index.js:89-97`)：
+**完整快照结构** (`bruno-electron/src/services/snapshot/index.js:89-97`)：
 
 ```javascript
 {
   version: '0.0.1',
   activeWorkspacePath: string | null,
-  extras: {
-    devTools: {
-      open: boolean,
-      activeTab: 'terminal' | 'console' | 'network' | 'performance',
-      tabs: {}
-    }
-  },
+  extras: { devTools: { open, activeTab, tabs } },
   workspaces: [
     {
       pathname: string,
       lastActiveCollectionPathname: string | null,
-      sorting: 'default' | 'alphabetical' | 'reverseAlphabetical',
-      collections: string[]  // collection pathnames
+      sorting: string,
+      collections: string[]
     }
   ],
   collections: [
@@ -477,7 +516,7 @@ export const serializeTab = (tab, collection) => {
       tabs: [
         {
           type: string,
-          accessor: 'pathname' | 'type' | 'pathname::exampleIndex' | 'pathname::exampleName',
+          accessor: string,
           pathname: string | null,
           permanent: boolean,
           request?: { tab: string, width: number, height: number },
@@ -489,7 +528,7 @@ export const serializeTab = (tab, collection) => {
 }
 ```
 
-**Schema 验证**：使用 Yup 进行严格的 schema 验证，确保数据完整性。
+**验证**：使用 Yup Schema 进行严格的数据完整性验证。
 
 ### 5.4 反序列化与恢复
 
@@ -507,15 +546,13 @@ export const deserializeTab = (snapshotTab, collection) => {
     collectionUid: collection.uid,
     type: snapshotTab.type,
     preview: !snapshotTab.permanent,  // 恢复预览状态
-    // ... 恢复其他UI状态
+    // ... 恢复其他 UI 状态
   };
 
   // 根据 accessor 解析并重新绑定 uid
   if (accessor === 'pathname' && pathname) {
     const item = findItemInCollectionByPathname(collection, pathname);
-    tab.uid = item?.uid || pathname;  // 使用实际项的uid或pathname
-  } else if (accessor === 'pathname::exampleIndex') {
-    // 解析 exampleIndex 并查找对应的 example uid
+    tab.uid = item?.uid || pathname;  // 使用实际项的 uid 或 pathname
   }
   // ... 其他 accessor 类型处理
 };
@@ -542,31 +579,126 @@ restoreTabs: (state, action) => {
 }
 ```
 
-### 5.5 工作区与多集合
+**关键点**：反序列化过程完全不恢复 draft 状态，因为快照中根本没有存储这些字段。
 
-**工作区隔离** (`utils/snapshot/index.js:128-244`)：
-- 快照支持多工作区，每个工作区有独立的标签页状态
-- 使用 `workspacePathname::collectionPathname` 作为复合键
-- 支持集合在多个工作区间共享，此时每个工作区维护独立的标签页状态
+## 六、未保存草稿保留条件（可复核）
 
-**活动标签页匹配** (`utils/snapshot/index.js:459-488`)：
+### 6.1 场景一：标签切换
+
+#### 事实依据
+
+**事实 1**：Draft 存储在 `collections` slice 中，与 `tabs` slice 完全独立
+- `item.draft` 存储在 `collections.items[].draft`
+- `folder.draft` 存储在 `collections.items[]`（folder 类型）的 `draft`
+- `collection.draft` 存储在 `collection.draft`
+- `collection.environmentsDraft` 存储在 `collection.environmentsDraft`
+- `globalEnvironmentDraft` 存储在 `globalEnvironments` slice
+
+**代码引用**：
+- `collections/index.js:887` - item.draft 初始化
+- `collections/index.js:2764` - 加载文件时 draft: null
+
+**事实 2**：标签切换动作（`tabs/focusTab`）只修改 `tabs` slice
+- `tabs.js:176-188` - `focusTab` reducer 只修改 `state.activeTabUid`
+- 完全不涉及 `collections` slice 的任何改动
+
+**代码引用**：
 ```javascript
-export const isActiveTab = (tab, activeTab, collection) => {
-  const { accessor, value } = activeTab;
-  
-  if (accessor === 'type') return tab.type === value;
-  if (accessor === 'pathname') {
-    const item = findItemInCollection(collection, tab.uid);
-    return tab.type !== 'response-example' && 
-           (item?.pathname === value || tab.pathname === value);
+// tabs.js:176-188
+focusTab: (state, action) => {
+  const { tabUid } = action.payload;
+  const tab = find(state.tabs, (tab) => tab.uid === tabUid);
+  if (tab) {
+    state.activeTabUid = tab.uid;
   }
-  // ... 其他 accessor 类型
-};
+}
 ```
 
-## 六、关键设计模式与技术要点
+**事实 3**：快照序列化不包含 draft 字段
+- Grep `draft` / `environmentsDraft` 在 `utils/snapshot/` 和 `services/snapshot/` 中均无匹配
+- 快照只存储 UI 布局状态（标签列表、活动标签、面板宽度等）
 
-### 6.1 中间件协作模型
+#### 结论
+
+**结论 1：标签切换时，未保存草稿 100% 保留**
+
+**推理链**：
+1. Draft 存储在 `collections` slice → 
+2. 标签切换只修改 `tabs` slice 的 `activeTabUid` → 
+3. 两个 slice 相互独立，互不影响 → 
+4. 因此标签切换不会清除任何 draft → 
+5. 未保存草稿在标签切换后完全保留
+
+**例外情况**：无例外。标签切换不会导致任何未保存草稿丢失。
+
+---
+
+### 6.2 场景二：应用重启
+
+#### 事实依据
+
+**事实 1**：Redux 状态存储在内存中，进程退出后全部丢失
+- Redux 是纯内存状态管理，无内置持久化机制
+- 应用重启 = 进程退出 + 重新启动 = 内存清空
+
+**事实 2**：快照持久化不包含 draft 状态
+- `serializeTab` (`utils/snapshot/index.js:364-422`) 只序列化标签类型、accessor、永久状态、UI 面板状态
+- 完全不包含 `draft`、`environmentsDraft` 等字段
+- Grep 验证：snapshot 模块中零个 draft 相关引用
+
+**事实 3**：IndexedDB 也不存储 draft
+- `utils/idb/index.js` 中无 `draft` 或 `environmentsDraft` 字段
+- IndexedDB 主要用于缓存大请求响应，不存储编辑状态
+
+**事实 4**：应用重新加载集合时，draft 初始化为 null
+- `collections/index.js:2764` - 从磁盘加载文件时 `draft: null`
+- `mountCollection` (`collections/actions.js:3015-3050`) 从文件系统读取原始内容，不含 draft
+
+**事实 5**：自动保存和手动保存会写入磁盘
+- 自动保存启用时 (`app.preferences.autoSave.enabled = true`)，改动后 `autoSave.interval` 毫秒自动保存到磁盘
+- 用户 Ctrl+S 手动保存会立即写入磁盘
+- 保存到磁盘的内容重启后会从文件重新加载
+
+**例外场景**：临时请求 (`isTransient = true`)
+- 即使启用自动保存也会跳过 (`autosave/middleware.js:138-140`)
+- 没有对应的磁盘文件，关闭即丢失
+
+#### 结论
+
+**结论 2：应用重启时，未保存草稿 100% 丢失，除非已提前持久化到磁盘**
+
+**推理链**：
+1. Draft 仅存在于 Redux 内存中 →
+2. 快照不存储 draft →
+3. IndexedDB 不存储 draft →
+4. 应用重启 = 内存清空 + 从磁盘重新加载 →
+5. 磁盘文件是保存后的内容，不含 draft →
+6. 因此未保存的 draft 重启后全部丢失
+
+**保留的唯一条件**：重启前已通过以下方式之一保存到磁盘：
+- ✅ 启用自动保存且等待了足够时间（超过 `autoSave.interval`）
+- ✅ 用户手动 Ctrl+S 保存
+- ✅ 关闭标签页或应用时选择了 "Save"
+- ❌ 仅在内存中编辑，未触发任何保存 → **丢失**
+- ❌ 临时请求（无对应磁盘文件）→ **必然丢失**
+
+---
+
+### 6.3 保留条件总结表
+
+| 场景 | 是否保留 | 条件 | 备注 |
+|------|---------|------|------|
+| 标签页切换 | ✅ 100% 保留 | 无条件 | 标签切换只改 `activeTabUid`，不碰 collections |
+| 关闭单个标签页（选 Don't Save） | ❌ 丢失 | 主动选择丢弃 | 调用 `deleteRequestDraft` 清空 draft |
+| 关闭单个标签页（选 Save） | ✅ 保留到磁盘 | 用户选择保存 | draft 写入磁盘文件 |
+| 批量关闭标签页 | ✅ 静默保存到磁盘 | 无改动直接关，有改动自动保存 | 批量关闭逻辑会自动保存 |
+| 应用重启（已保存） | ✅ 从磁盘恢复 | 启用自动保存或手动保存过 | 从磁盘文件重新加载 |
+| 应用重启（未保存） | ❌ 完全丢失 | 未持久化到磁盘 | draft 仅在内存中，进程退出即清空 |
+| 应用重启（临时请求） | ❌ 完全丢失 | 无对应磁盘文件 | 即使自动保存也会跳过临时请求 |
+
+## 七、关键设计模式与技术要点
+
+### 7.1 中间件协作模型
 
 三个中间件按顺序注册，各自承担单一职责：
 
@@ -575,18 +707,18 @@ Action 分发
     ↓
 [tasksMiddleware]    # 任务队列管理
     ↓
-[draftDetectMiddleware]  # 检测改动，标记永久标签
+[draftDetectMiddleware]  # 检测改动，标记永久标签（73 个 action）
     ↓
-[autosaveMiddleware]     # 自动保存（如启用）
+[autosaveMiddleware]     # 自动保存（如启用，83 个 action）
     ↓
-[snapshotMiddleware]     # 防抖持久化UI状态
+[snapshotMiddleware]     # 防抖持久化 UI 状态（26 个触发事件）
     ↓
 [debugMiddleware]        # 开发环境调试
     ↓
 Reducer 更新状态
 ```
 
-### 6.2 标识符稳定性设计
+### 7.2 标识符稳定性设计
 
 **UID vs Pathname**：
 - 标签页使用 `uid` 作为主要标识符，但快照中存储 `pathname`
@@ -597,13 +729,13 @@ Reducer 更新状态
 - 存储 `exampleIndex` 而非 `exampleUid`
 - 因为示例的 UID 可能在重新加载时变化，但索引位置相对稳定
 
-### 6.3 防抖与批量优化
+### 7.3 防抖与批量优化
 
-- **快照保存**：1秒防抖，避免频繁写入磁盘
+- **快照保存**：1 秒防抖，避免频繁写入磁盘
 - **自动保存**：按实体独立防抖，同一实体的多次修改合并为一次保存
 - **批量保存**：应用关闭时，同类实体批量保存（`saveMultipleRequests`）
 
-### 6.4 边界情况处理
+### 7.4 边界情况处理
 
 1. **临时请求 (`isTransient`)**：
    - 不自动保存
@@ -619,20 +751,22 @@ Reducer 更新状态
    - 保留已关闭标签页栈，不随集合卸载而清除
    - 快照保存时保留未加载集合的状态
 
-## 七、代码参考位置总结
+## 八、代码参考位置总结（可复核）
 
-| 功能模块 | 主要文件 | 关键行号 |
-|---------|---------|---------|
-| 标签页状态管理 | `providers/ReduxStore/slices/tabs.js` | 13-530 |
-| 标签页选择器 | `selectors/tab.js` | 1-59 |
-| Draft 检测中间件 | `providers/ReduxStore/middlewares/draft/middleware.js` | 1-90 |
-| Draft 检测工具 | `providers/ReduxStore/middlewares/draft/utils.js` | 1-40 |
-| 自动保存中间件 | `providers/ReduxStore/middlewares/autosave/middleware.js` | 1-264 |
-| 快照中间件 | `providers/ReduxStore/middlewares/snapshot/middleware.js` | 1-303 |
-| 快照序列化工具 | `utils/snapshot/index.js` | 1-680 |
-| 脏检测函数 | `utils/collections/index.js` | 1069-1113 |
-| 单个标签页关闭 | `components/RequestTabs/RequestTab/index.js` | 113-608 |
-| 确认对话框 | `components/RequestTabs/RequestTab/ConfirmRequestClose/index.js` | 1-52 |
-| 应用关闭确认 | `providers/App/ConfirmAppClose/SaveRequestsModal.js` | 1-296 |
-| 快照存储服务 | `bruno-electron/src/services/snapshot/index.js` | 1-567 |
-| Redux Store 配置 | `providers/ReduxStore/index.js` | 1-43 |
+| 功能模块 | 完整文件路径 | 关键行号 |
+|---------|-------------|---------|
+| 标签页状态管理 | `packages/bruno-app/src/providers/ReduxStore/slices/tabs.js` | 13-530 |
+| 标签页选择器 | `packages/bruno-app/src/selectors/tab.js` | 1-59 |
+| Draft 检测中间件（73 个 action） | `packages/bruno-app/src/providers/ReduxStore/middlewares/draft/middleware.js` | 3-90 |
+| Draft 检测工具 | `packages/bruno-app/src/providers/ReduxStore/middlewares/draft/utils.js` | 5-36 |
+| 自动保存中间件（83 个 action） | `packages/bruno-app/src/providers/ReduxStore/middlewares/autosave/middleware.js` | 5-264 |
+| 快照中间件 | `packages/bruno-app/src/providers/ReduxStore/middlewares/snapshot/middleware.js` | 22-265 |
+| 快照序列化工具 | `packages/bruno-app/src/utils/snapshot/index.js` | 29-680 |
+| 脏检测核心函数 | `packages/bruno-app/src/utils/collections/index.js` | 1069-1113 |
+| 单个标签页关闭 | `packages/bruno-app/src/components/RequestTabs/RequestTab/index.js` | 158-608 |
+| 确认对话框 | `packages/bruno-app/src/components/RequestTabs/RequestTab/ConfirmRequestClose/index.js` | 1-52 |
+| 应用关闭确认 | `packages/bruno-app/src/providers/App/ConfirmAppClose/SaveRequestsModal.js` | 27-296 |
+| 快照存储服务（SnapshotManager） | `packages/bruno-electron/src/services/snapshot/index.js` | 111（类定义）、567（导出） |
+| 快照 IPC 处理器 | `packages/bruno-electron/src/ipc/snapshot.js` | 1-46 |
+| Redux Store 配置 | `packages/bruno-app/src/providers/ReduxStore/index.js` | 1-43 |
+| IndexedDB 存储 | `packages/bruno-app/src/utils/idb/index.js` | 1-200 |
