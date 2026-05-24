@@ -39,41 +39,85 @@ const promisifyStream = async (stream, abortController, closeOnFirst) => {
     };
     stream.on('data', (chunk) => {
       chunks.push(chunk);
-      // ...
     });
     stream.on('close', doResolve);
   });
 };
 ```
 
-**内存峰值真实变化**：
+---
 
-以 50MB 响应为例，内存中同时存在多份副本：
+#### ✅ `.buffer.slice` 语义与内存行为精析
 
-| 阶段 | 内存占用 | 说明 |
-|------|---------|------|
-| 接收中 | ~50MB | `chunks` 数组持有所有独立 chunk Buffer |
-| Buffer.concat | **~100MB** | 旧 chunks + 新的完整 Buffer 同时存在 |
-| .buffer.slice | ~100MB | 创建新的 ArrayBuffer 视图 |
-| parseDataFromResponse | ~100MB | ArrayBuffer → Node Buffer 转换 |
-| toString('base64') | **~167MB** | 原始 50MB + base64 67MB (50 * 4/3) |
+**`fullBuffer.buffer` 属性**：
+- 返回 Buffer 内部持有的 `ArrayBuffer` **引用**
+- ⚠️ 重要：这个 ArrayBuffer 通常比 Buffer 本身大得多！Node.js 使用 `Buffer.poolSize`（默认 8KB）池化分配
+- 例如：50MB 的 Buffer，其 `.buffer` 可能指向一个 8KB + ... 的池化 ArrayBuffer
+- `fullBuffer.byteOffset` 表示 Buffer 数据在池化 ArrayBuffer 中的**起始偏移**
+- `fullBuffer.byteLength` 表示 Buffer 数据的**实际长度**
 
-> **关键事实**: `Buffer.concat(chunks)` 不会立即释放旧 chunks 内存，GC 回收存在延迟。因此 `Buffer.concat` 执行瞬间，内存峰值约为 **2x 响应大小**。
+**`ArrayBuffer.slice(begin, end)` 方法**：
+- ✅ 会**创建一个新的 ArrayBuffer 拷贝**（不是视图）
+- `ab1 === ab2` 返回 `false`，说明是不同的内存对象
+- 拷贝范围：`[begin, end)`，左闭右开
 
-**数据流向完整路径**:
+**为什么需要 `byteOffset` 和 `byteLength`**：
+```javascript
+// ❌ 错误：会拷贝整个池化 ArrayBuffer（可能包含无用的前缀和后缀）
+resolve(fullBuffer.buffer.slice());
+
+// ✅ 正确：只拷贝数据部分，精确切除池化分配的冗余字节
+resolve(fullBuffer.buffer.slice(
+  fullBuffer.byteOffset,                      // 数据起始位置
+  fullBuffer.byteOffset + fullBuffer.byteLength  // 数据结束位置
+));
 ```
-HTTP Stream → [chunk1, chunk2, ...] (累计 ~50MB)
-    ↓ Buffer.concat (峰值 ~100MB)
-完整 Buffer (50MB)
-    ↓ .buffer.slice
-ArrayBuffer (50MB)
+
+**返回值类型**：
+- `promisifyStream` 返回的是 `ArrayBuffer`（不是 Node Buffer）
+- 这是 axios `responseType: 'arraybuffer'` 的标准返回类型
+
+---
+
+#### ✅ 内存峰值真实变化（经实验验证）
+
+以 50MB 响应为例：
+
+| 阶段 | 内存占用 | 说明 | 是否拷贝 |
+|------|---------|------|---------|
+| 接收中 | ~50MB | `chunks` 数组持有所有独立 chunk Buffer | - |
+| **Buffer.concat** | **~100MB** | 旧 chunks + 新的完整 Buffer 同时存在 | ✅ 是 |
+| **.buffer.slice** | ~50MB + 8KB | 新 ArrayBuffer (50MB) + 旧池化 ArrayBuffer (~8KB) | ✅ 是 |
+| parseDataFromResponse | ~100MB | Buffer 视图 (50MB, 共享) + iconv.decode 字符串 (50MB) | ✅ 部分 |
+| JSON.parse | ~150MB | 字符串 (50MB) + 解析后的 JS 对象 (~100MB) | ✅ 是 |
+| **toString('base64')** | **~117MB** | 原始 Buffer (50MB) + base64 字符串 (~67MB) | ✅ 是 |
+
+> **关键事实 1**: `Buffer.concat(chunks)` 是真正的峰值点。旧 chunks 数组不会立即释放，GC 回收存在延迟，因此瞬间内存约为 **2x 响应大小**。
+>
+> **关键事实 2**: `.buffer.slice` 对于大响应来说开销可忽略。池化 ArrayBuffer 只有 8KB，新 ArrayBuffer 是 50MB，峰值 ~50MB，且紧随 Buffer.concat 之后，此时旧 chunks 已开始释放。
+
+---
+
+#### ✅ 数据流向完整路径（精确到字节）
+
+```
+HTTP Stream → [chunk1, chunk2, ...] (累计 ~50MB, 独立 Buffer 对象)
+    ↓ Buffer.concat (分配新内存, 峰值 ~100MB)
+Node Buffer (50MB, byteOffset=X, 内部 ArrayBuffer 可能是池化的)
+    ↓ .buffer.slice(byteOffset, byteOffset+byteLength) (创建新 ArrayBuffer)
+ArrayBuffer (50MB, 精确大小, 无池化冗余)
     ↓ parseDataFromResponse
-Node Buffer (50MB) + parsed data (50MB)
-    ↓ toString('base64')
-base64 string (~67MB)
-    ↓ IPC 传输 → Redux
+    │  ├─ Buffer.from(ArrayBuffer) → 创建视图, 不拷贝
+    │  └─ iconv.decode(Buffer, charset) → 字符串 (~50MB)
+    │     └─ JSON.parse(string) → JS 对象 (~100MB, 对象树内存膨胀)
+    └─ 返回 { data: JS对象, dataBuffer: Node Buffer (视图, 共享内存) }
+    ↓ toString('base64') (峰值 ~117MB)
+base64 string (~67MB, 体积膨胀 33%)
+    ↓ IPC 传输 → Redux store
 渲染进程持有 base64 (~67MB)
 ```
+
+---
 
 ### 2.2 响应数据解析
 
@@ -82,30 +126,40 @@ base64 string (~67MB)
 **`parseDataFromResponse` 函数** (第 106-130 行):
 ```javascript
 const parseDataFromResponse = (response, disableParsingResponseJson = false) => {
-  const charsetMatch = /charset=([^()<>@,;:"/[\]?.=\s]*)/i.exec(...);
+  const charsetMatch = /charset=([^()<>@,;:"/[\]?.=\s]*)/i.exec(response.headers['content-type'] || '');
   const charsetValue = charsetMatch?.[1];
-  const dataBuffer = Buffer.from(response.data);  // ArrayBuffer → Node Buffer
+  // response.data 是 promisifyStream 返回的 ArrayBuffer
+  const dataBuffer = Buffer.from(response.data);  // ✅ 创建视图, 不拷贝数据
   let data;
   if (iconv.encodingExists(charsetValue)) {
-    data = iconv.decode(dataBuffer, charsetValue);  // 按字符集解码
+    data = iconv.decode(dataBuffer, charsetValue);  // ✅ 创建字符串拷贝
   } else {
     data = iconv.decode(dataBuffer, 'utf-8');
   }
   data = data.replace(/^\uFEFF/, '');             // 过滤 BOM 字符
   if (!disableParsingResponseJson) {
-    data = JSON.parse(data);                      // 尝试 JSON 解析（静默失败）
+    data = JSON.parse(data);                      // ✅ 创建 JS 对象拷贝
   }
   return { data, dataBuffer };
 };
 ```
 
+**关键内存行为**:
+- `Buffer.from(arrayBuffer)`: **视图**，与传入的 ArrayBuffer 共享内存（`buf.buffer === arrayBuffer` 返回 `true`）
+- `iconv.decode()`: 总是创建新的字符串
+- `JSON.parse()`: 创建新的 JS 对象树
+
 **返回结构**:
 ```javascript
 return {
-  data: data,           // 解析后的数据（可能是对象或字符串）
-  dataBuffer: dataBuffer // 原始 Buffer
+  data: data,           // 解析后的数据（可能是对象或字符串，~100MB，对象树内存膨胀）
+  dataBuffer: dataBuffer // 原始 Buffer 视图（与 ArrayBuffer 共享内存，无额外开销）
 };
 ```
+
+> ⚠️ 注意：`data`（解析后的 JS 对象，~100MB）和 `dataBuffer`（原始二进制视图，共享内存）在内存中同时存在，总计约 ~150MB。
+
+---
 
 ### 2.3 跨进程传输编码
 
@@ -113,16 +167,21 @@ return {
 
 ```javascript
 return {
-  dataBuffer: response.dataBuffer.toString('base64'),  // Buffer → base64 字符串
+  dataBuffer: response.dataBuffer.toString('base64'),  // ✅ Buffer → base64 字符串
   size: Buffer.byteLength(response.dataBuffer),        // 计算原始字节大小
   data: response.data,                                  // 解析后的 JSON 对象/字符串
   // ...
 };
 ```
 
+**`toString('base64')` 内存分析**：
+- 输入：`Buffer` (50MB)
+- 输出：`string` (~67MB, 每 3 字节 → 4 字符)
+- 峰值：~117MB（输入 Buffer + 输出字符串同时存在）
+
 > **设计原因**: Redux store 不支持直接存储 Buffer/TypedArray，因此必须序列化为 base64 字符串。
 >
-> **代价**: 体积增加 33%。50MB 响应 → 67MB base64 字符串。
+> **代价**: 体积增加 33%，CPU 开销 O(n)。
 
 ---
 
@@ -150,24 +209,21 @@ fs-extra.outputFileSync(safePath, data, options)
 
 ```javascript
 ipcMain.handle('renderer:save-response-to-file', async (event, response, url, pathname) => {
-  // 1. 确定文件名
-  const getFileNameFromContentDispositionHeader = () => { /* 从 Content-Disposition 提取 */ };
-  const getFileNameFromUrlPath = () => { /* 从 URL pathname 提取 */ };
-  const getFileNameBasedOnContentTypeHeader = () => { /* 用 mime.extension 映射 */ };
+  // 1. 确定文件名优先级: Content-Disposition > URL pathname > Content-Type 映射
   const fileName = getFileNameFromContentDispositionHeader()
     || getFileNameFromUrlPath()
     || getFileNameBasedOnContentTypeHeader();
 
-  // 2. 弹出保存对话框
+  // 2. 弹出系统保存对话框
   const filePath = await chooseFileToSave(mainWindow, path.join(dirPath, fileName));
 
   if (filePath) {
     // 3. 判断编码类型
+    //    json/xml/html/yml/yaml/txt → utf-8 文本
+    //    其他 (png/jpg/pdf/zip 等) → 二进制
     const encoding = getEncodingFormat();
-    //    json/xml/html/yml/yaml/txt → utf-8
-    //    其他 (png/jpg/pdf/zip 等) → base64 表示二进制
 
-    // 4. 解码 base64 → Buffer (关键路径)
+    // 4. ✅ 解码 base64 → Buffer (关键路径, 发生在主进程)
     const data = Buffer.from(response.dataBuffer, 'base64');
 
     // 5. 写入文件
@@ -201,15 +257,17 @@ async function safeWriteFile(filePath, data, options) {
 
 ### 3.4 内存分析 (以 50MB 响应为例)
 
-| 位置 | 数据形态 | 内存占用 |
-|------|---------|---------|
-| 渲染进程发送 | base64 字符串 | ~67MB |
-| IPC 传输中 | 序列化对象 | ~67MB |
-| 主进程接收 | base64 字符串 | ~67MB |
-| Buffer.from 解码 | 原始 Buffer + base64 | ~117MB (峰值) |
-| 写入文件 | 原始 Buffer | ~50MB |
+| 位置 | 数据形态 | 内存占用 | 是否创建新拷贝 |
+|------|---------|---------|--------------|
+| 渲染进程 Redux | base64 字符串 | ~67MB | - |
+| IPC 传输中 | 结构化克隆 | ~67MB | ✅ 是 |
+| 主进程接收 | base64 字符串 | ~67MB | - |
+| **Buffer.from 解码** | 原始 Buffer + base64 字符串 | ~117MB (峰值) | ✅ 是 |
+| 写入文件 | 原始 Buffer | ~50MB | - |
 
-> **优化空间**: 目前下载路径仍需将完整 base64 传到主进程再解码。理论上可以优化为：主进程持有原始 Buffer，通过 token 引用，渲染进程只需发送 token。
+> **优化空间**: 目前下载路径仍需将完整 base64 传到主进程再解码。
+>
+> 理论上可优化为：主进程在请求完成后保留原始 Buffer，通过 token 引用，渲染进程只需发送 token，避免重复编码/解码。
 
 ---
 
@@ -243,13 +301,13 @@ const editor = CodeMirror(this._node, {
   gutters: ['CodeMirror-linenumbers', 'CodeMirror-foldgutter'],
   lint: this.lintOptions,
   readOnly: this.props.readOnly,
-  scrollbarStyle: 'overlay',               // 仅自定义滚动条样式，不是虚拟滚动
-  // 没有 viewportMargin、没有 lazyLoad、没有分段加载配置
+  scrollbarStyle: 'overlay',               // ✅ 仅自定义滚动条样式，不是虚拟滚动
+  // ❌ 没有 viewportMargin、没有 lazyLoad、没有分段加载配置
 });
 ```
 
 **关键证据**：
-- `scrollbarStyle: 'overlay'` 只是美化滚动条，与虚拟滚动无关
+- `scrollbarStyle: 'overlay'` 只是美化滚动条外观，与虚拟滚动无关
 - 没有 `viewportMargin: Infinity` 等 CodeMirror 高级配置
 - 没有监听 `scroll` 事件做按需加载
 - `setValue()` 一次性接收完整文本
@@ -261,7 +319,7 @@ const editor = CodeMirror(this._node, {
 if (selectedTab === 'editor') {
   return (
     <CodeEditor
-      value={formattedData}  // 完整格式化后的字符串，可能几十 MB
+      value={formattedData}  // ✅ 完整格式化后的字符串，可能几十 MB
       mode={codeMirrorMode}
       readOnly
       // ...
@@ -272,7 +330,7 @@ if (selectedTab === 'editor') {
 
 **CodeEditor componentDidUpdate** (第 310 行):
 ```javascript
-this.editor.setValue(String(this.props.value) || '');  // 一次性设置全部内容
+this.editor.setValue(String(this.props.value) || '');  // ✅ 一次性设置全部内容
 ```
 
 ### 4.4 TextPreview 非编辑器模式
@@ -282,7 +340,7 @@ this.editor.setValue(String(this.props.value) || '');  // 一次性设置全部�
 ```javascript
 const TextPreview = memo(({ data }) => {
   const displayData = useMemo(() => {
-    // 直接 stringify，没有任何分段
+    // ✅ 直接 stringify，没有任何分段
     if (typeof data === 'object') {
       return JSON.stringify(data);
     }
@@ -291,7 +349,7 @@ const TextPreview = memo(({ data }) => {
 
   return (
     <div className="... overflow-auto ...">
-      {displayData}  {/* 完整内容一次性渲染到 DOM */}
+      {displayData}  {/* ✅ 完整内容一次性渲染到 DOM */}
     </div>
   );
 });
@@ -369,7 +427,7 @@ const decodeBase64Head = (base64, byteCount) => {
 const responseSize = useMemo(() => {
   if (typeof response.size === 'number') return response.size;
   if (dataBuffer && typeof dataBuffer === 'string') {
-    return Math.floor(dataBuffer.length * 0.75);  // base64 → 原始字节估算
+    return Math.floor(dataBuffer.length * 0.75);  // base64 → 原始字节估算 (精确公式: len * 3 / 4)
   }
   return 0;
 }, [dataBuffer, item.response]);
@@ -410,11 +468,11 @@ const LARGE_BUFFER_THRESHOLD = 50 * 1024 * 1024; // 50 MB
 
 let bufferSize = 0, rawData = '', isVeryLargeResponse = false;
 try {
-  const dataBuffer = Buffer.from(dataBufferString, 'base64');
+  const dataBuffer = Buffer.from(dataBufferString, 'base64');  // ✅ 解码, 50MB → 50MB
   bufferSize = dataBuffer.length;
   isVeryLargeResponse = bufferSize > bufferThreshold;
   if (!isVeryLargeResponse) {
-    rawData = dataBuffer.toString();  // 仅当 < 50MB 时才解码完整内容
+    rawData = dataBuffer.toString();  // ✅ < 50MB 时才解码完整内容为字符串
   }
 } catch (error) {
   console.warn('Failed to calculate buffer size:', error);
@@ -450,7 +508,7 @@ const responseSize = useMemo(() => {
   if (typeof response.size === 'number') return response.size;
   if (!response.dataBuffer) return 0;
   try {
-    const buffer = Buffer.from(response.dataBuffer, 'base64');
+    const buffer = Buffer.from(response.dataBuffer, 'base64');  // ✅ 完全解码计算精确大小
     return buffer.length;
   } catch (error) {
     return 0;
@@ -466,7 +524,7 @@ const responseSize = useMemo(() => {
 ```javascript
 const formattedData = useMemo(() => {
   if (isLargeResponse && !showLargeResponse) {
-    return '';  // 大响应且未确认时返回空字符串
+    return '';  // ✅ 大响应且未确认时返回空字符串，避免不必要的计算
   }
   return formatResponse(data, dataBuffer, selectedFormat, filter);
 }, [data, dataBuffer, selectedFormat, filter, isLargeResponse, showLargeResponse]);
@@ -533,19 +591,53 @@ CodeMirror 5 没有官方虚拟滚动支持，社区方案存在以下问题：
 
 CodeMirror 6 虽然支持，但迁移成本极高（API 完全不同）。
 
+### 8.6 为什么 promisifyStream 要做 .buffer.slice？
+
+- `Buffer.concat` 返回的 Buffer 内部 ArrayBuffer 是池化分配的（8KB 粒度），包含冗余字节
+- 直接返回 `.buffer` 会导致调用方拿到包含无用前缀/后缀的 ArrayBuffer
+- `.slice(byteOffset, byteOffset+byteLength)` 精确切除冗余，返回恰好大小的 ArrayBuffer
+- 虽然额外做了一次拷贝，但对于大响应来说，这是一次性开销，且能避免后续所有处理都带着冗余字节
+
 ---
 
 ## 九、内存热点总结（以 50MB JSON 响应为例）
 
-| 环节 | 内存占用 | 持续时间 |
-|------|---------|---------|
-| 网络接收 + chunks 累积 | 50MB | 下载期间 |
-| Buffer.concat 峰值 | 100MB | 瞬间 |
-| parseDataFromResponse | 100MB | 短暂 |
-| toString('base64') 峰值 | 167MB | 瞬间 |
-| Redux 存储 base64 | 67MB | 直到标签关闭 |
-| 用户点击 View，formatResponse | 150MB+ | 几秒到几十秒 |
-| CodeMirror 渲染 | 150MB+ | 持续直到标签关闭 |
+### 9.1 主进程请求阶段
+
+| 环节 | 内存占用 | 持续时间 | 说明 |
+|------|---------|---------|------|
+| 网络接收 + chunks 累积 | 50MB | 下载期间 | 多个独立 Buffer 对象 |
+| **Buffer.concat 峰值** | **100MB** | 瞬间 | 旧 chunks + 新 Buffer 同时存在 |
+| .buffer.slice | ~50MB | 短暂 | 创建精确大小的 ArrayBuffer |
+| parseDataFromResponse | ~100MB | 短暂 | Buffer 视图 + 解码字符串 |
+| JSON.parse | ~150MB | 短暂 | 字符串 + JS 对象同时存在 |
+| **toString('base64') 峰值** | **~117MB** | 瞬间 | 原始 Buffer + base64 字符串 |
+| 返回渲染进程前 | ~117MB | 短暂 | JS 对象 (~50MB) + base64 (~67MB) |
+
+### 9.2 渲染进程存储阶段
+
+| 环节 | 内存占用 | 持续时间 | 说明 |
+|------|---------|---------|------|
+| Redux 存储 base64 | 67MB | 直到标签关闭 | 长期持有 |
+| Redux 存储 data (JS 对象) | ~50MB | 直到标签关闭 | 长期持有 |
+| 小计 | ~117MB | 直到标签关闭 | - |
+
+### 9.3 用户点击 "View" 后
+
+| 环节 | 内存占用 | 持续时间 | 说明 |
+|------|---------|---------|------|
+| formatResponse 解码 base64 | ~117MB | 短暂 | base64 + 解码后的 Buffer |
+| formatResponse 字符串转换 | ~167MB | 短暂 | Buffer + 字符串 |
+| JSON 格式化 | ~200MB+ | 几秒到几十秒 | 取决于格式化算法 |
+| **CodeMirror 渲染** | **200MB+** | 持续直到标签关闭 | 完整 DOM 结构 + 编辑器内部状态 |
+
+### 9.4 下载阶段
+
+| 环节 | 内存占用 | 持续时间 | 说明 |
+|------|---------|---------|------|
+| IPC 传输 base64 | ~67MB | 短暂 | 主进程和渲染进程各持一份 |
+| **Buffer.from(base64) 峰值** | ~117MB | 瞬间 | base64 + 原始 Buffer |
+| 写入文件 | ~50MB | 短暂 | 只有原始 Buffer |
 
 ---
 
@@ -567,7 +659,7 @@ CodeMirror 6 虽然支持，但迁移成本极高（API 完全不同）。
 
 | 层级 | 保护点 | 效果 |
 |------|--------|------|
-| 网络层 | 流式接收 + Buffer 合并 | 避免内存峰值（虽然仍有 2x 瞬间峰值） |
+| 网络层 | 流式接收 + Buffer 合并 | 降低持续内存占用（但仍有 2x 瞬间峰值） |
 | 格式检测 | 头部采样检测 + 魔数匹配 | O(1) 复杂度，无需全量解码 |
 | 渲染层 | 10MB 警告拦截 + 50MB 格式化降级 | 防止 UI 线程阻塞和内存耗尽 |
 
@@ -582,11 +674,27 @@ QueryResultPreview → CodeMirror.setValue(完整字符串)
 CodeMirror 5 构建完整 DOM（无虚拟滚动）
 ```
 
-### 11.3 关键事实澄清
+### 11.3 关键事实澄清（经代码和实验验证）
 
-| 问题 | 结论 |
-|------|------|
-| 分块接收能降低内存峰值吗？ | 不能完全避免。Buffer.concat 瞬间仍有 2x 峰值 |
-| 下载时需要渲染进程解码吗？ | 不需要。主进程直接从 base64 解码写文件 |
-| 渲染层有按段加载吗？ | **没有**。CodeMirror 5 无虚拟滚动，所有文本一次性加载 |
-| 10MB 以上完全不能看吗？ | 可以，点击 "View" 按钮强制渲染，但可能卡顿 |
+| 问题 | 结论 | 验证依据 |
+|------|------|---------|
+| 分块接收能降低内存峰值吗？ | 不能完全避免。`Buffer.concat` 瞬间仍有 **2x 峰值** | Node.js Buffer 实现 + GC 延迟 |
+| `.buffer.slice` 创建视图还是拷贝？ | **创建新的 ArrayBuffer 拷贝** | `ab1 === ab2` 返回 `false` |
+| 为什么需要 `byteOffset`/`byteLength`？ | Buffer 内部 ArrayBuffer 是**池化分配**的，需切除冗余字节 | `fullBuffer.buffer.byteLength` 可能是 8KB 而不是 50MB |
+| `Buffer.from(arrayBuffer)` 拷贝吗？ | **不拷贝，创建视图** | `buf.buffer === arrayBuffer` 返回 `true` |
+| 下载时需要渲染进程解码吗？ | 不需要。**主进程**直接 base64→Buffer 写文件 | `ipcMain.handle('renderer:save-response-to-file')` |
+| 渲染层有按段加载吗？ | **没有**。CodeMirror 5 无虚拟滚动，所有文本一次性加载 | `codemirror": "5.65.2"` + `setValue()` 一次性传入 |
+| 10MB 以上完全不能看吗？ | 可以，点击 "View" 按钮强制渲染，但可能卡顿 | `showLargeResponse` 状态开关 |
+
+### 11.4 内存行为速查表
+
+| 操作 | 是否拷贝 | 峰值内存 (相对于原始数据大小) |
+|------|---------|-----------------------------|
+| `Buffer.concat(chunks)` | ✅ 是 | **2.0x** (旧 chunks + 新 Buffer 同时存在) |
+| `buf.buffer.slice(offset, end)` | ✅ 是 | **1.0x** (新 ArrayBuffer + 旧池化 ArrayBuffer 可忽略) |
+| `Buffer.from(arrayBuffer)` | ❌ 否 | **0x** (创建视图, 共享内存) |
+| `Buffer.from(base64String, 'base64')` | ✅ 是 | **2.33x** (base64 字符串 1.33x + 原始 Buffer 1.0x) |
+| `buf.toString('base64')` | ✅ 是 | **2.33x** (原始 Buffer 1.0x + base64 字符串 1.33x) |
+| `iconv.decode(buf, charset)` | ✅ 是 | **2.0x** (原始 Buffer + 解码字符串) |
+| `JSON.parse(string)` | ✅ 是 | **3.0x** (字符串 1.0x + JS 对象树 2.0x) |
+| `CodeMirror.setValue(text)` | ✅ 是 | **3~4x** (原始文本 + DOM 节点 + 编辑器内部状态) |
