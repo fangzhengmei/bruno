@@ -407,51 +407,75 @@ const allDrafts = useMemo(() => {
 **三层持久化架构**：
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Renderer Process (React + Redux)                           │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  序列化工具                                           │  │
-│  │  路径: packages/bruno-app/src/utils/snapshot/index.js │  │
-│  │  职责: serializeTab()、deserializeTab()               │  │
-│  └───────────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  中间件                                               │  │
-│  │  路径: packages/bruno-app/src/providers/ReduxStore/   │  │
-│  │            middlewares/snapshot/middleware.js         │  │
-│  │  职责: 防抖监听 action，触发 IPC 调用                 │  │
-│  └───────────────────────────────────────────────────────┘  │
-└───────────────────────────────┬─────────────────────────────┘
-                                │ IPC 通信
-┌───────────────────────────────▼─────────────────────────────┐
-│  Main Process (Electron)                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  IPC 处理器                                           │  │
-│  │  路径: packages/bruno-electron/src/ipc/snapshot.js    │  │
-│  │  职责: 转发 renderer 调用到 SnapshotManager           │  │
-│  └───────────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  SnapshotManager 存储服务                             │  │
-│  │  路径: packages/bruno-electron/src/services/          │  │
-│  │            snapshot/index.js                          │  │
-│  │  类定义: line 111，class SnapshotManager              │  │
-│  │  导出: line 567，module.exports = new SnapshotManager()│  │
-│  │  存储: electron-store → ui-state-snapshot.json        │  │
-│  │  验证: Yup Schema 验证                                │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Renderer Process (React + Redux)                               │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  序列化工具                                               │  │
+│  │  路径: packages/bruno-app/src/utils/snapshot/index.js     │  │
+│  │  职责: serializeTab()、deserializeTab()                   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  防抖中间件                                               │  │
+│  │  路径: packages/bruno-app/src/providers/ReduxStore/       │  │
+│  │            middlewares/snapshot/middleware.js             │  │
+│  │  职责: 监听 25 个触发 action，1 秒防抖后调用 IPC           │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────┬─────────────────────────────┘
+                                    │ IPC 通信 (renderer:snapshot:save)
+┌───────────────────────────────────▼─────────────────────────────┐
+│  Main Process (Electron)                                        │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  SnapshotManager 存储服务（最终落地）                      │  │
+│  │  路径: packages/bruno-electron/src/services/snapshot/index.js│  │
+│  │  类定义: line 111，class SnapshotManager                  │  │
+│  │  导出: line 567，module.exports = new SnapshotManager()    │  │
+│  │  存储: electron-store → ui-state-snapshot.json            │  │
+│  │  验证: Yup Schema 验证                                    │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+**快照服务最终路径（统一为）**：`packages/bruno-electron/src/services/snapshot/index.js`
 
 ### 5.2 快照序列化
 
-**触发保存的 Action** (`utils/snapshot/index.js:29-55`)：
+**触发保存的 Action（共 25 个，可逐条复核）** (`utils/snapshot/index.js:29-55`)：
+
+| 行号 | Action 名称 | 分类 |
+|------|------------|------|
+| 30 | `app/setSnapshotReady` | 应用状态 |
+| 31 | `tabs/addTab` | 标签页操作 |
+| 32 | `tabs/closeTabs` | 标签页操作 |
+| 33 | `tabs/focusTab` | 标签页操作 |
+| 34 | `tabs/closeAllCollectionTabs` | 标签页操作 |
+| 35 | `tabs/reorderTabs` | 标签页操作 |
+| 36 | `tabs/makeTabPermanent` | 标签页操作 |
+| 37 | `tabs/updateRequestPaneTab` | UI 状态 |
+| 38 | `tabs/updateRequestPaneTabWidth` | UI 状态 |
+| 39 | `tabs/updateRequestPaneTabHeight` | UI 状态 |
+| 40 | `tabs/updateResponsePaneTab` | UI 状态 |
+| 41 | `tabs/updateResponsePaneScrollPosition` | UI 状态 |
+| 42 | `tabs/updateResponseFormat` | UI 状态 |
+| 43 | `tabs/updateResponseViewTab` | UI 状态 |
+| 44 | `tabs/updateScriptPaneTab` | UI 状态 |
+| 45 | `tabs/updateRequestBodyScrollPosition` | UI 状态 |
+| 46 | `workspaces/setActiveWorkspace` | 工作区 |
+| 47 | `collections/selectEnvironment` | 集合操作 |
+| 48 | `collections/sortCollections` | 集合操作 |
+| 49 | `collections/updateCollectionMountStatus` | 集合操作 |
+| 50 | `collections/toggleCollection` | 集合操作 |
+| 51 | `collections/expandCollection` | 集合操作 |
+| 52 | `logs/openConsole` | 控制台 |
+| 53 | `logs/closeConsole` | 控制台 |
+| 54 | `logs/setActiveTab` | 控制台 |
+| **合计** | | **25 个** |
+
 ```javascript
+// utils/snapshot/index.js:29-55
 export const SAVE_TRIGGERS = new Map([
   ['app/setSnapshotReady', null],
   ['tabs/addTab', null],
-  ['tabs/closeTabs', null],
-  ['tabs/focusTab', null],
-  ['tabs/updateRequestPaneTab', null],
-  // ... 共 26 种触发事件
+  // ... 共 25 个，line 30-54 逐条计数确认
 ]);
 ```
 
@@ -711,7 +735,7 @@ Action 分发
     ↓
 [autosaveMiddleware]     # 自动保存（如启用，83 个 action）
     ↓
-[snapshotMiddleware]     # 防抖持久化 UI 状态（26 个触发事件）
+[snapshotMiddleware]     # 防抖持久化 UI 状态（25 个触发事件）
     ↓
 [debugMiddleware]        # 开发环境调试
     ↓
@@ -751,7 +775,122 @@ Reducer 更新状态
    - 保留已关闭标签页栈，不随集合卸载而清除
    - 快照保存时保留未加载集合的状态
 
-## 八、代码参考位置总结（可复核）
+## 八、最终核准：切换保留、重启丢失条件清单（先事实后结论）
+
+### 8.1 核准说明
+
+本节所有结论均采用"先事实依据 → 后推导结论"的模式，每条事实均有对应代码行号可独立复核。
+
+---
+
+### 8.2 核准项 1：标签切换时，未保存草稿 100% 保留
+
+#### 事实依据（每条均可独立复核）
+
+| 编号 | 事实描述 | 代码位置 | 验证方式 |
+|------|---------|---------|---------|
+| T1 | Draft 存储在 `collections` slice，与 `tabs` slice 完全隔离 | `collections/index.js:887`、`collections/index.js:2764` | 检查 `item.draft` 字段初始化位置 |
+| T2 | 标签切换只调用 `tabs/focusTab`，仅修改 `activeTabUid` | `tabs.js:176-188` | 阅读 `focusTab` reducer 代码，确认不涉及 collections |
+| T3 | `tabs` 和 `collections` 是两个独立的 Redux slice | `providers/ReduxStore/index.js` | 检查 Store 配置中 slice 注册方式 |
+| T4 | 快照序列化不包含 `draft` 字段 | `utils/snapshot/index.js:364-422`、`services/snapshot/index.js` | Grep `draft` 关键词，两处均无匹配 |
+| T5 | 标签切换不触发任何 `deleteDraft` 类 action | `collections/index.js:776-782` | 搜索 `deleteRequestDraft` 调用位置，确认标签切换流程中无调用 |
+
+#### 结论推导链
+
+```
+T1（Draft 在 collections slice）
+       +
+T2（切换只改 tabs 的 activeTabUid）
+       +
+T3（两 slice 相互独立）
+       +
+T5（切换不触发 deleteDraft）
+       ↓
+标签切换对 draft 无任何操作 → 草稿 100% 保留
+```
+
+#### 最终结论
+
+✅ **标签切换场景：未保存草稿 100% 无条件保留**
+
+**例外情况**：无。无论是否启用自动保存、无论是否为临时请求，标签切换均不会导致草稿丢失。
+
+---
+
+### 8.3 核准项 2：应用重启时，未保存草稿 100% 丢失（除非已持久化）
+
+#### 事实依据（每条均可独立复核）
+
+| 编号 | 事实描述 | 代码位置 | 验证方式 |
+|------|---------|---------|---------|
+| R1 | Redux 状态完全存储在内存中，进程退出后清空 | Redux 官方设计 + `providers/ReduxStore/index.js` | 检查是否有任何内置持久化机制 |
+| R2 | 快照（snapshot）不存储 draft 字段 | `utils/snapshot/index.js:364-422`、`services/snapshot/index.js` | Grep `draft`、`environmentsDraft`，结果均为 0 匹配 |
+| R3 | IndexedDB 不存储 draft | `utils/idb/index.js` | Grep `draft`、`environmentsDraft`，结果均为 0 匹配 |
+| R4 | 从磁盘重新加载集合时，`draft` 初始化为 `null` | `collections/index.js:2764` | 检查加载文件时的初始化代码 `draft: null` |
+| R5 | 自动保存会写入磁盘，但需要启用并等待间隔 | `autosave/middleware.js:233-264` | 检查 `autoSave.enabled` 判断和 `autoSave.interval` 逻辑 |
+| R6 | 手动 Ctrl+S 会立即写入磁盘 | `collections/actions.js` 中的 `saveRequest` | 检查 saveRequest 调用后的文件系统写入 |
+| R7 | 临时请求（`isTransient=true`）即使启用自动保存也会跳过 | `autosave/middleware.js:138-140` | 检查 `isItemTransientRequest` 判断分支 |
+| R8 | 应用关闭时用户选择"Don't Save"会调用 `deleteRequestDraft` | `collections/index.js:776-782` | 检查 `deleteRequestDraft` reducer 逻辑 |
+
+#### 结论推导链
+
+```
+R1（Redux 仅在内存）+ R2（快照无 draft）+ R3（IndexedDB 无 draft）
+                      ↓
+          应用重启 = 进程退出 + 重新加载
+                      ↓
+  R4（重新加载时 draft: null）→ 未保存的 draft 全部丢失
+                      ↓
+          除非满足以下 R5/R6 之一
+                      ↓
+        R5（自动保存已触发） OR R6（手动 Ctrl+S）
+                      ↓
+          内容已写入磁盘文件，重启后从磁盘恢复
+```
+
+#### 最终结论
+
+❌ **应用重启场景：未保存草稿 100% 丢失**
+
+**唯一保留条件**（需满足以下任意一条）：
+
+| 条件 | 代码依据 | 说明 |
+|------|---------|------|
+| ✅ 自动保存已启用且等待超过 `autoSave.interval` | `autosave/middleware.js:233-264` | 默认间隔通常为 1000ms，需等待足够时间 |
+| ✅ 手动按下 Ctrl+S 保存 | `collections/actions.js` 的 `saveRequest` | 立即写入磁盘 |
+| ✅ 关闭标签页/应用时选择了"Save" | `ConfirmRequestClose/index.js`、`SaveRequestsModal.js` | 用户主动确认保存 |
+| ❌ 仅在内存中编辑，未触发任何保存 | - | 必然丢失 |
+| ❌ 临时请求（`isTransient=true`） | `autosave/middleware.js:138-140` | 无对应磁盘文件，必然丢失 |
+| ❌ 关闭时选择了"Don't Save" | `collections/index.js:776-782` | 主动调用 `deleteRequestDraft` 清空 |
+
+---
+
+### 8.4 完整保留条件速查表
+
+| 场景 | 是否保留 | 条件 | 事实依据 |
+|------|---------|------|---------|
+| 标签页切换 | ✅ 100% 保留 | 无条件 | T1-T5 |
+| 关闭单个标签页选 Don't Save | ❌ 丢失 | 主动选择丢弃 | R8 |
+| 关闭单个标签页选 Save | ✅ 保留到磁盘 | 用户选择保存 | R6 |
+| 批量关闭标签页 | ✅ 静默保存到磁盘 | 无改动直接关，有改动自动保存 | R5 |
+| 应用重启（已保存） | ✅ 从磁盘恢复 | 自动/手动保存过 | R5、R6 |
+| 应用重启（未保存） | ❌ 完全丢失 | 未持久化到磁盘 | R1-R4 |
+| 应用重启（临时请求） | ❌ 完全丢失 | 无对应磁盘文件 | R7 |
+
+---
+
+### 8.5 核心数字核准表
+
+| 指标 | 核准数值 | 代码位置 | 验证方式 |
+|------|---------|---------|---------|
+| draftDetectMiddleware 拦截 action 数 | 73 个 | `draft/middleware.js:3-82` | Grep `'collections\/` |
+| autosaveMiddleware 拦截 action 数 | 83 个 | `autosave/middleware.js:5-94` | Grep `'collections\/|'global-environments\/` |
+| SAVE_TRIGGERS 快照触发事件数 | 25 个 | `utils/snapshot/index.js:30-54` | 逐条计数 |
+| 快照服务最终路径 | `packages/bruno-electron/src/services/snapshot/index.js` | 架构图 + 5.1 节 | 检查类定义 line 111、导出 line 567 |
+
+---
+
+## 九、代码参考位置总结（可复核）
 
 | 功能模块 | 完整文件路径 | 关键行号 |
 |---------|-------------|---------|
@@ -766,7 +905,7 @@ Reducer 更新状态
 | 单个标签页关闭 | `packages/bruno-app/src/components/RequestTabs/RequestTab/index.js` | 158-608 |
 | 确认对话框 | `packages/bruno-app/src/components/RequestTabs/RequestTab/ConfirmRequestClose/index.js` | 1-52 |
 | 应用关闭确认 | `packages/bruno-app/src/providers/App/ConfirmAppClose/SaveRequestsModal.js` | 27-296 |
-| 快照存储服务（SnapshotManager） | `packages/bruno-electron/src/services/snapshot/index.js` | 111（类定义）、567（导出） |
+| **快照存储服务（统一路径）** | `packages/bruno-electron/src/services/snapshot/index.js` | 111（类定义）、567（导出） |
 | 快照 IPC 处理器 | `packages/bruno-electron/src/ipc/snapshot.js` | 1-46 |
 | Redux Store 配置 | `packages/bruno-app/src/providers/ReduxStore/index.js` | 1-43 |
 | IndexedDB 存储 | `packages/bruno-app/src/utils/idb/index.js` | 1-200 |
