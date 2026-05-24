@@ -514,7 +514,7 @@ export const serializeTab = (tab, collection) => {
 
 ### 5.3 快照存储格式
 
-**完整快照结构** (`bruno-electron/src/services/snapshot/index.js:89-97`)：
+**完整快照结构** (`packages/bruno-electron/src/services/snapshot/index.js:89-97`)：
 
 ```javascript
 {
@@ -639,7 +639,7 @@ focusTab: (state, action) => {
 ```
 
 **事实 3**：快照序列化不包含 draft 字段
-- Grep `draft` / `environmentsDraft` 在 `utils/snapshot/` 和 `services/snapshot/` 中均无匹配
+- Grep `draft` / `environmentsDraft` 在 `utils/snapshot/` 和 `packages/bruno-electron/src/services/snapshot/` 中均无匹配
 - 快照只存储 UI 布局状态（标签列表、活动标签、面板宽度等）
 
 #### 结论
@@ -790,9 +790,9 @@ Reducer 更新状态
 | 编号 | 事实描述 | 代码位置 | 验证方式 |
 |------|---------|---------|---------|
 | T1 | Draft 存储在 `collections` slice，与 `tabs` slice 完全隔离 | `collections/index.js:887`、`collections/index.js:2764` | 检查 `item.draft` 字段初始化位置 |
-| T2 | 标签切换只调用 `tabs/focusTab`，仅修改 `activeTabUid` | `tabs.js:176-188` | 阅读 `focusTab` reducer 代码，确认不涉及 collections |
+| T2 | 标签切换只调用 `tabs/focusTab`，仅修改 `activeTabUid` | `tabs.js:162-168` | 阅读 `focusTab` reducer 代码，确认只赋值 `state.activeTabUid = uid`，不涉及 collections |
 | T3 | `tabs` 和 `collections` 是两个独立的 Redux slice | `providers/ReduxStore/index.js` | 检查 Store 配置中 slice 注册方式 |
-| T4 | 快照序列化不包含 `draft` 字段 | `utils/snapshot/index.js:364-422`、`services/snapshot/index.js` | Grep `draft` 关键词，两处均无匹配 |
+| T4 | 快照序列化不包含 `draft` 字段 | `utils/snapshot/index.js:364-422`、`packages/bruno-electron/src/services/snapshot/index.js` | Grep `draft` 关键词，两处均无匹配 |
 | T5 | 标签切换不触发任何 `deleteDraft` 类 action | `collections/index.js:776-782` | 搜索 `deleteRequestDraft` 调用位置，确认标签切换流程中无调用 |
 
 #### 结论推导链
@@ -824,12 +824,12 @@ T5（切换不触发 deleteDraft）
 | 编号 | 事实描述 | 代码位置 | 验证方式 |
 |------|---------|---------|---------|
 | R1 | Redux 状态完全存储在内存中，进程退出后清空 | Redux 官方设计 + `providers/ReduxStore/index.js` | 检查是否有任何内置持久化机制 |
-| R2 | 快照（snapshot）不存储 draft 字段 | `utils/snapshot/index.js:364-422`、`services/snapshot/index.js` | Grep `draft`、`environmentsDraft`，结果均为 0 匹配 |
+| R2 | 快照（snapshot）不存储 draft 字段 | `utils/snapshot/index.js:364-422`、`packages/bruno-electron/src/services/snapshot/index.js` | Grep `draft`、`environmentsDraft`，结果均为 0 匹配 |
 | R3 | IndexedDB 不存储 draft | `utils/idb/index.js` | Grep `draft`、`environmentsDraft`，结果均为 0 匹配 |
 | R4 | 从磁盘重新加载集合时，`draft` 初始化为 `null` | `collections/index.js:2764` | 检查加载文件时的初始化代码 `draft: null` |
 | R5 | 自动保存会写入磁盘，但需要启用并等待间隔 | `autosave/middleware.js:233-264` | 检查 `autoSave.enabled` 判断和 `autoSave.interval` 逻辑 |
 | R6 | 手动 Ctrl+S 会立即写入磁盘 | `collections/actions.js` 中的 `saveRequest` | 检查 saveRequest 调用后的文件系统写入 |
-| R7 | 临时请求（`isTransient=true`）即使启用自动保存也会跳过 | `autosave/middleware.js:138-140` | 检查 `isItemTransientRequest` 判断分支 |
+| R7 | 临时请求（`isTransient=true`）即使启用自动保存也会跳过 | `autosave/middleware.js:138-140`、`autosave/middleware.js:211-212` | 两处 `isItemTransientRequest` 判断分支：saveExistingDrafts 和 determineSaveHandler 均跳过 |
 | R8 | 应用关闭时用户选择"Don't Save"会调用 `deleteRequestDraft` | `collections/index.js:776-782` | 检查 `deleteRequestDraft` reducer 逻辑 |
 
 #### 结论推导链
@@ -860,7 +860,7 @@ R1（Redux 仅在内存）+ R2（快照无 draft）+ R3（IndexedDB 无 draft）
 | ✅ 手动按下 Ctrl+S 保存 | `collections/actions.js` 的 `saveRequest` | 立即写入磁盘 |
 | ✅ 关闭标签页/应用时选择了"Save" | `ConfirmRequestClose/index.js`、`SaveRequestsModal.js` | 用户主动确认保存 |
 | ❌ 仅在内存中编辑，未触发任何保存 | - | 必然丢失 |
-| ❌ 临时请求（`isTransient=true`） | `autosave/middleware.js:138-140` | 无对应磁盘文件，必然丢失 |
+| ❌ 临时请求（`isTransient=true`） | `autosave/middleware.js:138-140`、`autosave/middleware.js:211-212` | 无对应磁盘文件，两处自动保存判断均跳过 |
 | ❌ 关闭时选择了"Don't Save" | `collections/index.js:776-782` | 主动调用 `deleteRequestDraft` 清空 |
 
 ---
