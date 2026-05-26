@@ -334,27 +334,46 @@ const folderAuth = i?.draft
 
 ## 八、展示层与执行层的判定差异
 
-全代码库共有 **8 处独立实现** 的 auth 继承逻辑，分布在 3 个功能域：
+全代码库共有 **8 处独立实现** 的 auth 继承逻辑，分布在 2 个功能域：
 - **执行层**：3 处（`mergeAuth` × 2、`resolveInheritedAuth` × 1）
 - **来源展示层**：5 处（`getEffectiveAuthSource` × 5，分别在 Timeline、RequestPane Auth、WSAuth、GrpcAuth、FolderSettings Auth）
 
-它们在 `'none'` 处理、draft 读取、和遍历优先级上存在多处不一致。
+它们在 `'none'` 处理、draft 读取、和遍历优先级上存在多处不一致。本节统一口径：
+- **逻辑 Bug**：指继承判定规则本身错误（如不排除 `'none'`、遍历方向错误）
+- **draft 不可见**：指功能正确但看不到未保存的 draft（这是设计选择，不是逻辑 Bug）
 
-### 8.1 父目录来源是否最近优先？——遍历方向的深层 Bug
+### 8.1 8 处实现的逐点核对
 
-所有正确实现都遵循 **最近祖先优先** 原则，但 `FolderSettings/Auth/index.js` 是唯一的例外。
+| # | 实现位置 | 排除 `'none'` | draft 读取 | 遍历优先级 | 逻辑正确性 | 备注 |
+|---|----------|-------------|-----------|------------|-----------|------|
+| **执行层（3 处，全部正确）** | | | | | | |
+| 1 | `bruno-cli/src/utils/collection.js:458` | ✅ 是 | ✅ draft 优先 | 最近优先 | ✅ 正确 | CLI `mergeAuth` |
+| 2 | `bruno-electron/src/utils/collection.js:795` | ✅ 是 | ✅ draft 优先 | 最近优先 | ✅ 正确 | Electron `mergeAuth` |
+| 3 | `bruno-app/src/utils/auth/index.js:32` | ✅ 是 | ✅ draft 优先 | 最近优先 | ✅ 正确 | `resolveInheritedAuth` |
+| **展示层（5 处，2 处有 Bug）** | | | | | | |
+| 4 | `ResponsePane/Timeline/index.js:34` | ✅ 是 | ❌ 只读 `root` | 最近优先 | ✅ 正确 | Timeline OAuth2 来源追踪 |
+| 5 | `RequestPane/Auth/index.js:60` | ❌ **否** | ❌ 只读 `root` | 最近优先 | ❌ Bug | 普通 HTTP 请求 Auth 标签页，`'none'` 会误判为有效来源 |
+| 6 | `RequestPane/WSRequestPane/WSAuth/index.js:54` | ✅ 是 | ❌ 只读 `root` | 最近优先 | ✅ 正确 | WebSocket 请求 |
+| 7 | `RequestPane/GrpcRequestPane/GrpcAuth/index.js:63` | ✅ 是 | ❌ 只读 `root` | 最近优先 | ✅ 正确 | gRPC 请求 |
+| 8 | `FolderSettings/Auth/index.js:76` | ❌ **否** | ✅ draft 优先 | ❌ **最远优先** | ❌ **双重 Bug** | Folder 设置页面，同时有两个 Bug |
 
-| 实现位置 | 遍历方式 | 优先级 | 是否正确 |
-|----------|----------|--------|----------|
-| `mergeAuth`（CLI/Electron） | 正向遍历 `[folderA, folderB, req]`，不 break，后面覆盖前面 | 最近优先 ✅ | 是 |
-| `resolveInheritedAuth`（utils） | 反向遍历 `[req, folderB, folderA]`，break 第一个匹配 | 最近优先 ✅ | 是 |
-| `getEffectiveAuthSource`（Timeline） | 反向遍历，break 第一个匹配 | 最近优先 ✅ | 是 |
-| `getEffectiveAuthSource`（RequestPane Auth） | 反向遍历，break 第一个匹配 | 最近优先 ✅ | 是 |
-| `getEffectiveAuthSource`（WSAuth） | 反向遍历，break 第一个匹配 | 最近优先 ✅ | 是 |
-| `getEffectiveAuthSource`（GrpcAuth） | 反向遍历，break 第一个匹配 | 最近优先 ✅ | 是 |
-| `getEffectiveAuthSource`（FolderSettings Auth） | **正向遍历** `[folderA, folderB, current]`，`i=0` 到 `length-2`，break 第一个匹配 | **最远优先** ❌ | **Bug** |
+**关键结论（统一口径）**：
+- **真正的逻辑 Bug 只有 2 处**：`RequestPane/Auth/index.js` 和 `FolderSettings/Auth/index.js`
+- **其他 6 处继承逻辑均正确**：Timeline、WSAuth、GrpcAuth、3 处执行层
+- **所有展示层都只读 `root`，不读 draft**：这是设计选择（展示"已保存"的来源，而非"即将执行"的来源），但会造成 UI 与实际执行的偏差
 
-**FolderSettings Auth 的 Bug 细节**（`FolderSettings/Auth/index.js:71-83`）：
+### 8.2 父目录来源是否最近优先？——唯一的遍历方向 Bug
+
+7 处实现都遵循 **最近祖先优先** 原则，但 `FolderSettings/Auth/index.js` 是唯一的例外。
+
+| 实现位置 | 遍历方式 | 优先级 |
+|----------|----------|--------|
+| `mergeAuth`（CLI/Electron） | 正向遍历 `[folderA, folderB, req]`，不 break，后面覆盖前面 | 最近优先 ✅ |
+| `resolveInheritedAuth`（utils） | 反向遍历 `[req, folderB, folderA]`，break 第一个匹配 | 最近优先 ✅ |
+| 4 处 `getEffectiveAuthSource` | 反向遍历，break 第一个匹配 | 最近优先 ✅ |
+| `getEffectiveAuthSource`（FolderSettings Auth） | 正向遍历 `[folderA, folderB, current]`，`i=0` 到 `length-2`，break 第一个匹配 | **最远优先** ❌ |
+
+**FolderSettings Auth 的遍历 Bug 细节**（`FolderSettings/Auth/index.js:71-83`）：
 
 ```js
 const folderTreePath = getTreePathFromCollectionToItem(collection, folder);
@@ -363,6 +382,7 @@ const folderTreePath = getTreePathFromCollectionToItem(collection, folder);
 for (let i = 0; i < folderTreePath.length - 1; i++) {  // i=0 → folderA, i=1 → folderB
   const parentFolder = folderTreePath[i];
   if (parentFolder.type === 'folder') {
+    const parentFolderRoot = parentFolder?.draft || parentFolder?.root;
     const folderAuth = get(parentFolderRoot, 'request.auth');
     if (folderAuth && folderAuth.mode && folderAuth.mode !== 'inherit') {
       effectiveSource = { ... };
@@ -372,7 +392,7 @@ for (let i = 0; i < folderTreePath.length - 1; i++) {  // i=0 → folderA, i=1 �
 }
 ```
 
-场景：
+**可复现场景**：
 ```
 Collection  auth: { mode: 'none' }
   └─ FolderA  auth: { mode: 'bearer', token: 'FAR' }  (远层)
@@ -383,47 +403,25 @@ Collection  auth: { mode: 'none' }
 - **实际执行**：FolderB 的子请求继承最近的 FolderB.basic → 正确
 - **FolderSettings UI 显示**："Auth inherited from FolderA: Bearer Token" → 错误（显示了最远的祖先）
 
-### 8.2 `inherit/none` 处理分歧与实现统计
+### 8.3 `'none'` 处理分歧与可复现实例
 
-8 处实现的完整对比：
+**判定边界对比**：
 
-| 实现位置 | 判定条件 | 排除 `'none'` | draft 读取路径 | 遍历优先级 |
-|----------|----------|-------------|---------------|------------|
-| **执行层（正确的）** | | | | |
-| `bruno-cli/src/utils/collection.js:458` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | `i?.draft \|\| i?.root` → `folderRoot.request.auth` | 最近优先 |
-| `bruno-electron/src/utils/collection.js:795` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | `i?.draft \|\| i?.root` → `folderRoot.request.auth` | 最近优先 |
-| `bruno-app/src/utils/auth/index.js:32` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | `i?.draft ? 'draft.request.auth' : 'root.request.auth'` | 最近优先 |
-| **展示层（有 Bug 的）** | | | | |
-| `bruno-app/src/components/RequestPane/Auth/index.js:60` | `mode !== 'inherit'` | ❌ 否 | 只读 `'root.request.auth'` | 最近优先 |
-| `bruno-app/src/components/FolderSettings/Auth/index.js:76` | `mode !== 'inherit'` | ❌ 否 | `parentFolder?.draft \|\| parentFolder?.root` → `'request.auth'` | **最远优先** ❌ |
-| **展示层（部分正确的）** | | | | |
-| `bruno-app/src/components/ResponsePane/Timeline/index.js:34` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | 只读 `'root.request.auth'` | 最近优先 |
-| `bruno-app/src/components/RequestPane/WSRequestPane/WSAuth/index.js:54` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | 只读 `'root.request.auth'` | 最近优先 |
-| `bruno-app/src/components/RequestPane/GrpcRequestPane/GrpcAuth/index.js:63` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | 只读 `'root.request.auth'` | 最近优先 |
+| 实现 | 判定条件 | `mode: 'none'` 的处理 |
+|------|----------|----------------------|
+| 执行层 + Timeline + WSAuth + GrpcAuth | `mode !== 'none' && mode !== 'inherit'` | ✅ 跳过，继续向上找 |
+| RequestPane Auth + FolderSettings Auth | `mode !== 'inherit'` | ❌ 当作有效来源，停止查找 |
 
-**关于 draft 存储路径的重要更正**：
-- **Collection** draft：`collection.draft.root.request.auth`（含 `.root`）
-- **Folder** draft：`folder.draft.request.auth`（**不含** `.root`，之前的分析此处有误）
-- **Request** draft：`item.draft.request.auth`（**不含** `.root`，之前的分析此处有误）
-
-在 Redux store 中可验证（`collections/index.js:2477-2508`）：
-```js
-set(folder, 'draft.request.auth', {});              // Folder 无 .root
-set(folder, 'draft.request.auth.mode', action.payload.mode);
-set(collection, 'draft.root.request.auth', {});     // Collection 有 .root
-```
-
-### 8.3 `'none'` 误判的可复现实例
+**`'none'` 误判的可复现实例**：
 
 **场景 setup**：
-
 1. Collection 根 auth：`mode: 'bearer'`, `token: 'COL_TOKEN'`（已保存）
 2. FolderA auth：`mode: 'none'`（已保存）
 3. FolderA 下的 Request auth：`mode: 'inherit'`
 
 **代码路径对比**：
 
-`RequestPane/Auth/index.js:59-60`（UI 展示）：
+`RequestPane/Auth/index.js:59-60`（UI 展示，有 Bug）：
 ```js
 const folderAuth = get(i, 'root.request.auth');  // 读到 FolderA.auth = { mode: 'none' }
 if (folderAuth && folderAuth.mode && folderAuth.mode !== 'inherit') {  // 只排除 'inherit'，不排除 'none'
@@ -433,7 +431,7 @@ if (folderAuth && folderAuth.mode && folderAuth.mode !== 'inherit') {  // 只排
 // UI 显示："Auth inherited from FolderA: No Auth"
 ```
 
-`mergeAuth`（CLI/Electron 执行，`collection.js:457-458`）：
+`mergeAuth`（CLI/Electron 执行，`collection.js:457-458`，正确）：
 ```js
 const folderAuth = get(folderRoot, 'request.auth');  // 同样读到 FolderA.auth = { mode: 'none' }
 if (folderAuth && folderAuth.mode
@@ -450,50 +448,70 @@ if (folderAuth && folderAuth.mode
 - 实际发送：带 `Authorization: Bearer COL_TOKEN` 头
 - 这是一个 **会导致安全误判的功能性 Bug**
 
+**Folder `'none'` 与 Request `'none'` 的语义差异**：
+在执行层，两者的语义完全不同：
+- **Folder auth = `'none'`**：仅表示"此 Folder 不提供鉴权配置"，不阻断继承链，也不会传递给后代
+- **Request auth = `'none'`**：表示"此请求明确不使用任何鉴权"，`mergeAuth` 的 `request.auth.mode === 'inherit'` 条件不满足，直接跳过继承
+
+但在 `RequestPane/Auth` 的展示逻辑中，Folder 的 `'none'` 被当作有效继承源，混淆了两者的语义。
+
 ### 8.4 未保存配置（draft）参与继承时的偏差
 
-draft 是 Bruno 的核心特性——用户编辑但未保存的内容会进入 `item.draft` 字段，不影响 `item.root` 或 `item.request` 的已保存值。
+**关于 draft 存储路径的重要更正**：
+- **Collection** draft：`collection.draft.root.request.auth`（含 `.root`）
+- **Folder** draft：`folder.draft.request.auth`（**不含** `.root`，之前的分析此处有误）
+- **Request** draft：`item.draft.request.auth`（**不含** `.root`，之前的分析此处有误）
 
-**偏差来源 1：展示层只读 `root`，不读 `draft`**
-
-`RequestPane/Auth/index.js:59`：
+在 Redux store 中可验证（`collections/index.js:2477-2508`）：
 ```js
-const folderAuth = get(i, 'root.request.auth');  // 只读取已保存值，看不到 draft
+set(folder, 'draft.request.auth', {});              // Folder 无 .root
+set(folder, 'draft.request.auth.mode', action.payload.mode);
+set(collection, 'draft.root.request.auth', {});     // Collection 有 .root
 ```
 
-而 `mergeAuth`（`bruno-cli/src/utils/collection.js:455-457`）：
-```js
-const folderRoot = i?.draft || i?.root;  // draft 优先
-const folderAuth = get(folderRoot, 'request.auth');
-```
+**draft 不可见的可复现场景**：
 
-**可复现场景**：
+场景：
 1. FolderA 已保存 auth：`mode: 'none'`
 2. 用户在 FolderA 设置中把 auth 改成 `mode: 'bearer'`, `token: 'DRAFT_TOKEN'`，**未保存**（存在 `FolderA.draft.request.auth`）
 3. 子请求 Request auth：`mode: 'inherit'`
 4. **RequestPane Auth 标签页显示**："Auth inherited from Collection: Bearer Token"（只读 `root`，看不到 FolderA 的 draft）
 5. **实际发送（Electron 点击 Send）**：使用 FolderA 的 draft bearer token → `Authorization: Bearer DRAFT_TOKEN`
 
-**偏差来源 2：CLI 从不读取 draft**
-
+**CLI/GUI 执行差异**：
 CLI 直接从文件系统解析，`collection.items` 中没有 `draft` 字段。因此：
 - CLI 执行：始终使用已保存的值
 - Electron 执行：当前用户未保存的 draft 会影响执行结果
 
 这意味着 **同样的请求，在 CLI 和 GUI 中执行结果可能不同**——如果用户修改了 Folder auth 但未保存，GUI 用新值，CLI 用旧值。
 
-**偏差来源 3：Collection 级 draft 的读取不一致**
+### 8.5 冲突如何影响定位实际生效鉴权来源
 
-`prepareRequest` 第 357 行：
-```js
-const collectionRoot = collection?.draft?.root ? get(collection, 'draft.root', {}) : get(collection, 'root', {});
-```
+当用户想知道"这个请求到底用了什么鉴权"时，多处实现的不一致会造成严重的定位困难：
 
-Collection 级的 draft 会影响执行，但 Folder 级 draft 的读取取决于具体实现。
+**问题 1：不同 UI 展示不同的来源**
+- RequestPane Auth 标签页（HTTP）：可能显示"FolderA: No Auth"（Bug）
+- Response Timeline：显示"Collection: Bearer Token"（正确）
+- FolderSettings 页面：可能显示"FolderX"（最远祖先，遍历 Bug）
+- WSAuth/GrpcAuth 标签页：显示正确来源，但只适用于特定请求类型
 
-### 8.5 如何核对实际生效的鉴权来源
+用户在不同地方看到不同结论，不知道该信哪个。
 
-当怀疑 UI 展示与实际执行不一致时，可通过以下方式核对（按可信度排序）：
+**问题 2：展示的是"已保存来源"，执行的是"含 draft 来源"**
+- 所有展示层都只读 `root`，不读 draft
+- 执行层（Electron）draft 优先
+- 用户看到的是"保存前的来源"，实际发送的是"含未保存修改的来源"
+
+**问题 3：`'none'` 的语义歧义**
+- 用户看到 "Auth inherited from FolderA: No Auth" 时，有两种可能的理解：
+  1. ❌ 错误理解："这个请求不鉴权"（实际会用 Collection 的鉴权）
+  2. ✅ 正确理解："FolderA 设为 No Auth，我会继续向上找"
+
+但 UI 文字并没有提示"继续向上找"，用户几乎必然会按第一种理解。
+
+### 8.6 如何核对实际生效的鉴权来源
+
+当怀疑 UI 展示与实际执行不一致时，按以下可信度排序核对：
 
 **方法 1：检查实际发送的请求头（100% 可信）**
 
@@ -517,7 +535,7 @@ CLI 不涉及 draft，结果代表"已保存配置的真实行为"。
 
 执行层的唯一真相来源是 `mergeAuth` + `setAuthHeaders` 第二段的组合，可在 `bruno-electron/src/ipc/network/prepare-request.js:376` 打断点查看 `request.auth` 被替换后的值。
 
-**⚠️ 不要信任 Auth 标签页的 "Auth inherited from..." 文字**——它同时存在 `'none'` 误判和 draft 不可见两个问题。
+**⚠️ 不要信任普通 HTTP 请求 Auth 标签页的 "Auth inherited from..." 文字**——它同时存在 `'none'` 误判和 draft 不可见两个问题。
 
 ---
 
@@ -525,17 +543,18 @@ CLI 不涉及 draft，结果代表"已保存配置的真实行为"。
 
 1. **三级定义**：Collection → Folder → Request，每级都可独立设置 auth
 2. **树路径不含 Collection**：`getTreePathFromCollectionToItem` 返回从顶级 Item 到目标 Item 的路径，不包含 Collection 虚拟根节点；Collection auth 通过 `collection.root.request.auth` 独立获取
-3. **inherit = 向上找**：`mode: 'inherit'` 触发沿树向上查找第一个非 `inherit`/`none` 的祖先 Folder auth，若找不到则使用 Collection auth 兜底
-4. **就近覆盖（执行层正确）**：多个 Folder 都设了具体 auth 时，离请求最近的生效；`mergeAuth` 和 6 处展示层实现正确，仅 `FolderSettings/Auth/index.js` 是 **最远优先** 的 Bug
-5. **none 不传递（执行层）**：Folder 设为 `'none'` 不会被子请求继承，子请求 `inherit` 会跳过它继续向上找
-6. **none 与 none 语义不同**：Folder auth = `'none'` 表示"此 Folder 不提供鉴权配置"；Request auth = `'none'` 表示"此请求明确不使用任何鉴权"
-7. **UI `'none'` 误判 Bug**：`RequestPane/Auth/index.js` 和 `FolderSettings/Auth/index.js` 未排除 `'none'`，Folder 设为 `'none'` 时 UI 显示"继承自 FolderX: No Auth"，但实际会跳过该 Folder 使用更上层的鉴权
-8. **draft 路径差异**：Collection draft = `collection.draft.root.request.auth`（含 `.root`）；Folder draft = `folder.draft.request.auth`（不含 `.root`）；Request draft = `item.draft.request.auth`（不含 `.root`）
-9. **draft 偏差**：执行层（Electron 发送请求）会考虑 Folder draft auth，但展示层（RequestPane Auth 标签页）只读已保存的 `root`，可能出现 UI 展示与实际执行不一致
-10. **CLI/GUI 差异**：CLI 从文件解析无 draft，始终使用已保存值；GUI 未保存的 draft 会影响执行结果
-11. **8 处独立实现**：全代码库有 8 处 auth 继承实现，分为执行层（3 处）和展示层（5 处），多处存在不一致
-12. **FolderSettings 遍历 Bug**：`FolderSettings/Auth/index.js` 正向遍历 + break = 最远优先，而非最近优先，会展示错误的继承来源
-13. **请求自主**：请求自身非 `inherit` 时，祖先 auth 完全不影响
-14. **整体替换**：auth 继承是整个对象的替换，不是字段级 merge
-15. **两段冗余**：`setAuthHeaders` 的第一段代码在正常流程下不会触发，是历史遗留的防御性代码
-16. **核对真相**：对鉴权来源存疑时，优先查看 **实际发送的请求头**，其次是 Response Timeline，不要信任 Auth 标签页的继承来源文字
+3. **inherit = 向上找（执行层）**：`mode: 'inherit'` 触发沿树向上查找第一个非 `inherit`/`none` 的祖先 Folder auth，若找不到则使用 Collection auth 兜底
+4. **8 处独立实现，2 处逻辑 Bug**：全代码库有 8 处 auth 继承实现（执行层 3 处，展示层 5 处）；仅 `RequestPane/Auth/index.js` 和 `FolderSettings/Auth/index.js` 有逻辑 Bug，其余 6 处正确
+5. **就近覆盖（6 处正确）**：多个 Folder 都设了具体 auth 时，离请求最近的生效；仅 `FolderSettings/Auth/index.js` 是 **最远优先** 的遍历 Bug
+6. **none 不传递（执行层）**：Folder 设为 `'none'` 不会被子请求继承，子请求 `inherit` 会跳过它继续向上找
+7. **none 与 none 语义不同**：Folder auth = `'none'` 表示"此 Folder 不提供鉴权配置"；Request auth = `'none'` 表示"此请求明确不使用任何鉴权"
+8. **UI `'none'` 误判 Bug**：`RequestPane/Auth/index.js` 和 `FolderSettings/Auth/index.js` 未排除 `'none'`，Folder 设为 `'none'` 时 UI 显示"继承自 FolderX: No Auth"，但实际会跳过该 Folder 使用更上层的鉴权
+9. **draft 路径差异**：Collection draft = `collection.draft.root.request.auth`（含 `.root`）；Folder draft = `folder.draft.request.auth`（不含 `.root`）；Request draft = `item.draft.request.auth`（不含 `.root`）
+10. **draft 不可见（设计选择）**：所有展示层都只读 `root`，不读 draft；执行层（Electron）draft 优先；UI 展示的是"已保存来源"，实际执行的是"含 draft 来源"
+11. **CLI/GUI 执行差异**：CLI 从文件解析无 draft，始终使用已保存的值；GUI 未保存的 draft 会影响执行结果
+12. **FolderSettings 双重 Bug**：`FolderSettings/Auth/index.js` 同时存在遍历方向错误（最远优先）和 `'none'` 未排除两个 Bug
+13. **不同 UI 展示可能不一致**：普通 HTTP 请求 Auth 标签页可能展示错误来源；Timeline、WSAuth、GrpcAuth 展示正确来源；用户在不同地方可能看到不同结论
+14. **请求自主**：请求自身非 `inherit` 时，祖先 auth 完全不影响
+15. **整体替换**：auth 继承是整个对象的替换，不是字段级 merge
+16. **两段冗余**：`setAuthHeaders` 的第一段代码在正常流程下不会触发，是历史遗留的防御性代码
+17. **核对真相**：对鉴权来源存疑时，优先查看 **实际发送的请求头**（100% 可信），其次是 Response Timeline，不要信任普通 HTTP 请求 Auth 标签页的继承来源文字
