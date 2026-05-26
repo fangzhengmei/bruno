@@ -332,14 +332,136 @@ const folderAuth = i?.draft
 
 ---
 
-## 七、总结：核心规则速查
+## 八、展示层与执行层的判定差异
+
+代码中存在多份继承逻辑的实现，它们在 `'none'` 处理和 draft 读取上存在细微但重要的差异。
+
+### 8.1 `inherit/none` 处理分歧
+
+全代码库共有 7 处实现了继承逻辑，分为两大阵营：
+
+| 实现位置 | 判定条件 | 是否排除 `'none'` | 是否考虑 draft |
+|----------|----------|------------------|----------------|
+| **执行层** | | | |
+| `bruno-cli/src/utils/collection.js:458` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | ✅ 是（`i?.draft \|\| i?.root`） |
+| `bruno-electron/src/utils/collection.js:795` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | ✅ 是 |
+| `bruno-app/src/utils/auth/index.js:32` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | ✅ 是 |
+| **展示层（不一致的）** | | | |
+| `bruno-app/src/components/RequestPane/Auth/index.js:60` | `mode !== 'inherit'` | ❌ 否 | ❌ 否（只读 `i.root`） |
+| `bruno-app/src/components/FolderSettings/Auth/index.js:76` | `mode !== 'inherit'` | ❌ 否 | ✅ 是（`parentFolder?.draft \|\| ...`） |
+| **展示层（一致的）** | | | |
+| `bruno-app/src/components/ResponsePane/Timeline/index.js:34` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | ❌ 否（只读 `i.root`） |
+| `bruno-app/src/components/RequestPane/WSRequestPane/WSAuth/index.js:54` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | ❌ 否（只读 `i.root`） |
+| `bruno-app/src/components/RequestPane/GrpcRequestPane/GrpcAuth/index.js:63` | `mode !== 'none' && mode !== 'inherit'` | ✅ 是 | ❌ 否（只读 `i.root`） |
+
+**分歧 1：`'none'` 是否参与继承**
+
+`RequestPane/Auth/index.js:60` 和 `FolderSettings/Auth/index.js:76` 的判断条件只排除了 `'inherit'`，没有排除 `'none'`。这意味着：
+
+```
+Collection  auth: { mode: 'bearer', bearer: { token: 'COL' } }
+  └─ FolderA  auth: { mode: 'none' }
+       └─ Request  auth: { mode: 'inherit' }
+```
+
+- **展示层（RequestPane Auth 标签页）**：显示 "Auth inherited from FolderA: No Auth"
+- **执行层（实际发送请求）**：跳过 FolderA 的 `'none'`，使用 Collection 的 bearer token
+
+**这是一个功能性 Bug**：UI 告诉用户"此请求不鉴权"，但实际发送时却带了鉴权头。
+
+**分歧 2：Folder `'none'` 与 Request `'none'` 的语义差异**
+
+在执行层，两者的语义完全不同：
+- **Folder auth = `'none'`**：仅表示"此 Folder 不提供鉴权配置"，不阻断继承链，也不会传递给后代
+- **Request auth = `'none'`**：表示"此请求明确不使用任何鉴权"，`mergeAuth` 的 `request.auth.mode === 'inherit'` 条件不满足，直接跳过继承
+
+但在 `RequestPane/Auth` 的展示逻辑中，Folder 的 `'none'` 被当作有效继承源，混淆了两者的语义。
+
+### 8.2 未保存配置（draft）参与继承时的偏差
+
+draft 是 Bruno 的核心特性——用户编辑但未保存的内容会进入 `item.draft` 字段，不影响 `item.root` 或 `item.request` 的已保存值。
+
+**偏差来源 1：展示层只读 `root`，不读 `draft`**
+
+`RequestPane/Auth/index.js:59`：
+```js
+const folderAuth = get(i, 'root.request.auth');  // 只读取已保存值
+```
+
+`ResponsePane/Timeline/index.js:33`：
+```js
+const folderAuth = get(i, 'root.request.auth');  // 只读取已保存值
+```
+
+而 `mergeAuth`（`bruno-cli/src/utils/collection.js:455`）：
+```js
+const folderRoot = i?.draft || i?.root;  // draft 优先
+const folderAuth = get(folderRoot, 'request.auth');
+```
+
+场景：
+1. 用户在 FolderA 中把 auth 从 `'none'` 改成 `'bearer'`，**未保存**（存在 `FolderA.draft.root.request.auth`）
+2. 子请求 Request 的 auth 是 `'inherit'`
+3. **展示层**：显示继承自 Collection（因为只读 `root`，看不到 draft）
+4. **执行层（Electron 中点击发送）**：实际使用 FolderA 的 draft bearer token
+
+**偏差来源 2：CLI 从不读取 draft**
+
+CLI 直接从文件系统解析，`collection.items` 中没有 `draft` 字段。因此：
+- CLI 执行：始终使用已保存的值
+- Electron 执行：当前用户未保存的 draft 会影响执行结果
+
+这意味着 **同样的请求，在 CLI 和 GUI 中执行结果可能不同**——如果用户修改了 Folder auth 但未保存，GUI 用新值，CLI 用旧值。
+
+**偏差来源 3：Collection 级 draft 的读取不一致**
+
+`prepareRequest` 第 357 行：
+```js
+const collectionRoot = collection?.draft?.root ? get(collection, 'draft.root', {}) : get(collection, 'root', {});
+```
+
+Collection 级的 draft 会影响执行，但 Folder 级 draft 的读取取决于具体实现。
+
+### 8.3 如何核对实际生效的鉴权来源
+
+当怀疑 UI 展示与实际执行不一致时，可通过以下方式核对：
+
+**方法 1：查看 Response Timeline**
+
+`ResponsePane/Timeline/index.js` 中的 `getEffectiveAuthSource` 在 `'none'` 处理上与执行层一致（排除 `'none'`），是最可靠的 UI 来源。它会显示：
+- "Auth inherited from Collection" / "Auth inherited from FolderX"
+- 配合 OAuth2 调用记录，可以看到实际 token 的获取来源
+
+**方法 2：检查实际发送的请求头**
+
+在 Timeline 的 Request 详情中查看 `Authorization` 等鉴权头的实际值，这是最直接的证据。
+
+**方法 3：使用 CLI 执行验证**
+
+```bash
+bruno run path/to/request.bru --env production
+```
+
+CLI 不涉及 draft，结果代表"已保存配置的真实行为"。
+
+**方法 4：代码级核对**
+
+执行层的唯一真相来源是 `mergeAuth` + `setAuthHeaders` 第二段的组合，可在 `bruno-electron/src/ipc/network/prepare-request.js:376` 打断点查看 `request.auth` 被替换后的值。
+
+---
+
+## 九、总结：核心规则速查
 
 1. **三级定义**：Collection → Folder → Request，每级都可独立设置 auth
 2. **树路径不含 Collection**：`getTreePathFromCollectionToItem` 返回从顶级 Item 到目标 Item 的路径，不包含 Collection 虚拟根节点；Collection auth 通过 `collection.root.request.auth` 独立获取
 3. **inherit = 向上找**：`mode: 'inherit'` 触发沿树向上查找第一个非 `inherit`/`none` 的祖先 Folder auth，若找不到则使用 Collection auth 兜底
 4. **就近覆盖**：多个 Folder 都设了具体 auth 时，离请求最近的生效
-5. **none 不传递**：Folder 设为 `'none'` 不会被子请求继承，子请求 `inherit` 会跳过它继续向上找
-6. **请求自主**：请求自身非 `inherit` 时，祖先 auth 完全不影响
-7. **draft 参与**：未保存的 draft auth 在 UI 层也会参与继承计算
-8. **整体替换**：auth 继承是整个对象的替换，不是字段级 merge
-9. **两段冗余**：`setAuthHeaders` 的第一段代码在正常流程下不会触发，是历史遗留的防御性代码
+5. **none 不传递（执行层）**：Folder 设为 `'none'` 不会被子请求继承，子请求 `inherit` 会跳过它继续向上找
+6. **none 与 none 语义不同**：Folder auth = `'none'` 表示"此 Folder 不提供鉴权配置"；Request auth = `'none'` 表示"此请求明确不使用任何鉴权"
+7. **请求自主**：请求自身非 `inherit` 时，祖先 auth 完全不影响
+8. **draft 偏差**：执行层（Electron 发送请求）会考虑 Folder draft auth，但展示层（RequestPane Auth 标签页）只读已保存的 `root`，可能出现 UI 展示与实际执行不一致
+9. **CLI/GUI 差异**：CLI 从文件解析无 draft，始终使用已保存值；GUI 未保存的 draft 会影响执行结果
+10. **UI Bug 提示**：`RequestPane/Auth/index.js` 和 `FolderSettings/Auth/index.js` 未排除 Folder auth = `'none'`，可能误导用户
+11. **整体替换**：auth 继承是整个对象的替换，不是字段级 merge
+12. **两段冗余**：`setAuthHeaders` 的第一段代码在正常流程下不会触发，是历史遗留的防御性代码
+13. **核对真相**：对鉴权来源存疑时，查看 Response Timeline 或实际请求头，而非 Auth 标签页的继承来源文字
