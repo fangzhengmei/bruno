@@ -28,11 +28,30 @@ Bruno 的鉴权（Auth）可以在三个层级上定义，形成一条从根到�
 - CLI 层：`bruno-cli/src/utils/collection.js:439`
 - App 层：`bruno-app/src/utils/collections/index.js`
 
-它返回从 Collection 根到目标 Item 的完整路径数组，顺序为 **从根到叶**：
+实现核心：
+
+```js
+const getTreePathFromCollectionToItem = (collection, _item) => {
+  let path = [];
+  let item = findItemInCollection(collection, _item.pathname);
+  while (item) {
+    path.unshift(item);
+    item = findParentItemInCollection(collection, item.pathname);
+  }
+  return path;
+};
+```
+
+`findItemInCollection` 和 `findParentItemInCollection` 均在 `collection.items` 的扁平化结构中查找，**collection 自身不在 `collection.items` 中**，因此路径不包含集合虚拟根节点。
+
+它返回从 **顶级 Item** 到目标 Item 的路径数组，顺序为 **从根到叶**：
 
 ```
-[collectionItem(虚拟根), folderA, folderB, requestItem]
+[folderA, folderB, requestItem]   // 嵌套请求
+[requestItem]                     // 顶级请求
 ```
+
+**关键点**：路径始终包含目标 Item 自身（最后一个元素），遍历时通过 `i.type === 'folder'` 过滤，只处理 Folder 节点。Collection 级 auth 独立于树路径，在函数外部单独从 `collection.root.request.auth` 获取。
 
 ### 2.2 UI 层解析（`resolveInheritedAuth`）
 
@@ -51,12 +70,14 @@ export const resolveInheritedAuth = (item, collection) => {
     return mergedRequest;
   }
 
-  // 3. 以 Collection 级 auth 为兜底
+  // 3. 以 Collection 级 auth 为兜底（独立于树路径，从 collection.root 获取）
   const collectionRoot = collection?.draft?.root || collection?.root || {};
   const collectionAuth = get(collectionRoot, 'request.auth', { mode: 'none' });
   let effectiveAuth = collectionAuth;
 
-  // 4. 反向遍历文件夹（从近到远），找到第一个非 inherit/non-none 的 auth
+  // 4. 树路径不含 collection，从顶级 item 到目标 item；
+  //    反向遍历（从近到远），跳过目标 item 自身（i.type !== 'folder'），
+  //    找到第一个非 inherit/non-none 的 Folder auth
   for (let i of [...requestTreePath].reverse()) {
     if (i.type === 'folder') {
       const folderAuth = i?.draft
@@ -87,11 +108,14 @@ export const resolveInheritedAuth = (item, collection) => {
 
 ```js
 const mergeAuth = (collection, request, requestTreePath) => {
+  // Collection 级 auth 独立于树路径，从 collection.root 获取
   const collectionRoot = collection?.draft?.root || collection?.root || {};
   let collectionAuth = collectionRoot?.request?.auth || { mode: 'none' };
   let effectiveAuth = collectionAuth;
 
-  // 正向遍历：从远到近，后面的覆盖前面的
+  // 树路径不含 collection，从顶级 item 到目标 item；
+  // 正向遍历（从远到近），跳过目标 item 自身（i.type !== 'folder'），
+  // 更近的 Folder auth 覆盖更远的
   for (let i of requestTreePath) {
     if (i.type === 'folder') {
       const folderRoot = i?.draft || i?.root;
@@ -114,6 +138,8 @@ const mergeAuth = (collection, request, requestTreePath) => {
 与 UI 层逻辑等价：正向遍历不 break → 更近的 Folder 覆盖更远的 → 结果与反向 + break 一致。
 
 **关键约束**：`mergeAuth` 只在 `request.auth.mode === 'inherit'` 时才做替换。如果请求显式设为 `'none'` 或具体类型，不会被祖先覆盖。
+
+**Collection auth 的独立性**：Collection auth 不在树路径中，始终作为兜底值存在。当树路径中的所有 Folder 均为 `inherit` 或 `none` 时，最终使用的就是 Collection auth。
 
 ---
 
@@ -274,12 +300,17 @@ const folderAuth = i?.draft
 ```
 请求准备执行
     │
+    ├─ getTreePathFromCollectionToItem(collection, item)
+    │    → 返回 [顶级folder, ..., 父folder, requestItem]
+    │    → 注意：collection 自身不在路径中
+    │
     ├─ request.auth.mode === 'inherit' ?
     │      │
-    │      ├─ YES → 从 Collection 根取 auth 为 effectiveAuth
-    │      │         遍历树路径上的 Folder（从远到近）：
+    │      ├─ YES → effectiveAuth = collection.root.request.auth（独立兜底）
+    │      │         遍历树路径（从远到近 / 从近到远皆可）：
+    │      │           跳过 requestItem 自身（i.type !== 'folder'）
     │      │           若 Folder.auth.mode ∉ {'inherit', 'none'}
-    │      │             → effectiveAuth = Folder.auth（覆盖）
+    │      │             → effectiveAuth = Folder.auth（更近的覆盖更远的）
     │      │         最终 request.auth = effectiveAuth
     │      │
     │      └─ NO  → request.auth 保持不变（无论是 'none' 还是具体类型）
@@ -304,10 +335,11 @@ const folderAuth = i?.draft
 ## 七、总结：核心规则速查
 
 1. **三级定义**：Collection → Folder → Request，每级都可独立设置 auth
-2. **inherit = 向上找**：`mode: 'inherit'` 触发沿树向上查找第一个非 `inherit`/`none` 的祖先 auth
-3. **就近覆盖**：多个 Folder 都设了具体 auth 时，离请求最近的生效
-4. **none 不传递**：Folder 设为 `'none'` 不会被子请求继承，子请求 `inherit` 会跳过它继续向上找
-5. **请求自主**：请求自身非 `inherit` 时，祖先 auth 完全不影响
-6. **draft 参与**：未保存的 draft auth 在 UI 层也会参与继承计算
-7. **整体替换**：auth 继承是整个对象的替换，不是字段级 merge
-8. **两段冗余**：`setAuthHeaders` 的第一段代码在正常流程下不会触发，是历史遗留的防御性代码
+2. **树路径不含 Collection**：`getTreePathFromCollectionToItem` 返回从顶级 Item 到目标 Item 的路径，不包含 Collection 虚拟根节点；Collection auth 通过 `collection.root.request.auth` 独立获取
+3. **inherit = 向上找**：`mode: 'inherit'` 触发沿树向上查找第一个非 `inherit`/`none` 的祖先 Folder auth，若找不到则使用 Collection auth 兜底
+4. **就近覆盖**：多个 Folder 都设了具体 auth 时，离请求最近的生效
+5. **none 不传递**：Folder 设为 `'none'` 不会被子请求继承，子请求 `inherit` 会跳过它继续向上找
+6. **请求自主**：请求自身非 `inherit` 时，祖先 auth 完全不影响
+7. **draft 参与**：未保存的 draft auth 在 UI 层也会参与继承计算
+8. **整体替换**：auth 继承是整个对象的替换，不是字段级 merge
+9. **两段冗余**：`setAuthHeaders` 的第一段代码在正常流程下不会触发，是历史遗留的防御性代码
